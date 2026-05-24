@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 load_dotenv()
 
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-8-sig"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
 
 def _setup_logging(log_file: str) -> None:
     import os

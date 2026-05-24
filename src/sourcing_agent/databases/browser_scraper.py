@@ -33,10 +33,18 @@ async def search(
     password = os.environ.get(password_key, "")
     proxy_url = os.environ.get(proxy_key, "") if proxy_key else ""
 
+    _PLACEHOLDERS = ("your_email", "your_password", "placeholder", "institution.edu")
+
     if not username or not password:
         logger.warning(
             f"{name}: credentials missing (env vars: {username_key}, {password_key}) — skipping"
         )
+        return []
+
+    if any(p in username for p in _PLACEHOLDERS) or any(
+        p in password for p in _PLACEHOLDERS
+    ):
+        logger.warning(f"{name}: placeholder credentials detected — skipping")
         return []
 
     # Skip placeholder proxy URLs (not configured for real institution)

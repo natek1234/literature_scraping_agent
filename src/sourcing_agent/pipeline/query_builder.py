@@ -57,22 +57,12 @@ def build_queries(config: Config) -> dict[str, list[str]]:
             if not cluster_terms:
                 continue
 
-            if name == "Semantic Scholar":
-                # S2 is a semantic search engine — use natural language cluster terms directly.
-                # Complex boolean expressions cause 403/429; simple queries work better.
+            if name in ("Semantic Scholar", "arXiv"):
+                # S2 and arXiv both work best with natural language cluster terms.
+                # S2 rejects complex boolean; arXiv's category filter (applied in
+                # databases/arxiv.py) already scopes the discipline domain, so tier_1
+                # boolean strings are redundant and produce 0 results when quoted.
                 full_query = " ".join(cluster_terms[:6])
-            elif name == "arXiv":
-                # arXiv: use all: prefix for each term and boolean operators
-                and_op = _AND.get(name, " AND ")
-                tier1_parts = [
-                    f"all:{t}" if " " not in t else f'all:"{t}"'
-                    for t in config.keywords_tier_1
-                ]
-                base_query = and_op.join(tier1_parts)
-                cluster_part = or_op.join(
-                    f'"{t}"' if " " in t else t for t in cluster_terms[:8]
-                )
-                full_query = f"{base_query} AND ({cluster_part})"
             else:
                 and_op = _AND.get(name, " AND ")
                 tier1_parts = [_quote(t, name) for t in config.keywords_tier_1]

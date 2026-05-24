@@ -26,7 +26,7 @@ async def search(query: str, config: Config) -> list[PaperRecord]:
     start = 0
     batch_size = min(50, max_results)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         while start < max_results:
             params: dict[str, str | int] = {
                 "search_query": full_query,
