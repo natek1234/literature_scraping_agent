@@ -19,6 +19,7 @@ from ..models import PaperRecord
 if TYPE_CHECKING:
     from ..config import Config
     from ..progress import ProgressTracker
+    from ..summary import SummaryWriter
 
 _SYSTEM_PROMPT = """\
 You are a research librarian screening papers for a systematic literature review.
@@ -155,37 +156,105 @@ async def score_papers(
     records: list[PaperRecord],
     config: Config,
     progress: ProgressTracker,
+    summary: SummaryWriter | None = None,
+    scored_cache: str | None = None,
 ) -> list[PaperRecord]:
+    """Score all records, resuming from scored_cache if it exists.
+
+    Already-scored papers are loaded from scored_cache. New results are
+    appended to scored_cache after each batch, enabling crash recovery
+    without re-scoring completed papers.
+    """
     batch_size = config.relevance_scoring.parallel_batch_size
+
+    # ── Load already-scored papers from cache ────────────────────────────────
     all_scored: list[PaperRecord] = []
-    start_idx = progress.last_batch_index
+    if scored_cache and os.path.exists(scored_cache):
+        try:
+            with open(scored_cache, encoding="utf-8") as f:
+                all_scored = [
+                    PaperRecord.model_validate_json(line) for line in f if line.strip()
+                ]
+            logger.info(
+                f"Resuming scoring: loaded {len(all_scored)} already-scored papers "
+                f"from cache (skipping re-scoring)"
+            )
+        except Exception as e:
+            logger.warning(f"Could not load scored cache ({e}) — scoring from start")
+            all_scored = []
+
+    start_idx = len(all_scored)
+    remaining = len(records) - start_idx
+
+    if remaining == 0:
+        logger.info("All papers already scored — nothing to do")
+        return all_scored
 
     logger.info(
-        f"Scoring {len(records)} papers in batches of {batch_size}"
+        f"Scoring {remaining} papers in batches of {batch_size}"
         + (f" (resuming from index {start_idx})" if start_idx else "")
     )
 
-    # Pre-scored records (from a resumed run)
-    all_scored.extend(records[:start_idx])
+    # ── Open cache for appending ─────────────────────────────────────────────
+    cache_fh = None
+    if scored_cache:
+        os.makedirs(os.path.dirname(scored_cache) or ".", exist_ok=True)
+        cache_fh = open(scored_cache, "a", encoding="utf-8")
 
-    for i in range(start_idx, len(records), batch_size):
-        batch = records[i : i + batch_size]
-        tasks = [_score_single(paper, config) for paper in batch]
-        scored_batch = await asyncio.gather(*tasks, return_exceptions=False)
-        all_scored.extend(scored_batch)
-        progress.write_checkpoint(
-            "scoring",
-            {"last_batch_index": i + len(batch), "scored_so_far": len(all_scored)},
-        )
-        if (i // batch_size) % 5 == 0:
-            logger.info(f"Scoring progress: {len(all_scored)}/{len(records)}")
+    try:
+        for i in range(start_idx, len(records), batch_size):
+            batch = records[i : i + batch_size]
+            tasks = [_score_single(paper, config) for paper in batch]
+            scored_batch: list[PaperRecord] = await asyncio.gather(
+                *tasks, return_exceptions=False
+            )
+            all_scored.extend(scored_batch)
+
+            # Persist this batch immediately
+            if cache_fh:
+                for r in scored_batch:
+                    cache_fh.write(r.model_dump_json() + "\n")
+                cache_fh.flush()
+
+            progress.write_checkpoint(
+                "scoring",
+                {
+                    "last_batch_index": i + len(batch),
+                    "scored_so_far": len(all_scored),
+                },
+            )
+
+            # Update summary every 5 batches
+            batch_num = (i - start_idx) // batch_size
+            if summary is not None and batch_num % 5 == 0:
+                n_inc = sum(1 for r in all_scored if r.inclusion_decision == "include")
+                n_may = sum(1 for r in all_scored if r.inclusion_decision == "maybe")
+                n_exc = sum(1 for r in all_scored if r.inclusion_decision == "exclude")
+                n_err = sum(
+                    1
+                    for r in all_scored
+                    if r.agent_notes and "SCORING_ERROR" in r.agent_notes
+                )
+                summary.update_scoring(
+                    total=len(records),
+                    scored=len(all_scored),
+                    include=n_inc,
+                    maybe=n_may,
+                    exclude=n_exc,
+                    errors=n_err,
+                )
+
+            if (i // batch_size) % 5 == 0:
+                logger.info(f"Scoring progress: {len(all_scored)}/{len(records)}")
+    finally:
+        if cache_fh:
+            cache_fh.close()
 
     return all_scored
 
 
 async def _score_single(paper: PaperRecord, config: Config) -> PaperRecord:
     abstract = paper.abstract or "[No abstract available]"
-    # Cap section_fit for no-abstract non-NTRS papers — handled post-scoring
     prompt = _USER_TEMPLATE.format(
         project_title=config.project_title,
         research_question=config.research_question[:800],
@@ -238,7 +307,6 @@ async def _call_claude(prompt: str) -> dict:
     if text_block is None:
         raise ValueError("No TextBlock in Claude response")
     text = text_block.text.strip()
-    # Strip markdown fences if Claude added them despite instructions
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
@@ -251,7 +319,6 @@ def _apply_scoring(paper: PaperRecord, data: dict, config: Config) -> PaperRecor
     contribution = float(data.get("contribution_score") or 0.0)
     recency = float(data.get("recency_score") or 0.0)
 
-    # Cap section_fit for no-abstract non-NTRS papers
     if not paper.abstract and paper.source_type not in (
         "technical_report",
         "mission_document",
@@ -262,15 +329,15 @@ def _apply_scoring(paper: PaperRecord, data: dict, config: Config) -> PaperRecor
     inclusion = _assign_inclusion_from_score(weighted, config)
 
     kunze_dim = data.get("kunze_dimension")
-    if kunze_dim == "null" or kunze_dim == "":
+    if kunze_dim in ("null", ""):
         kunze_dim = None
 
     cluster = data.get("technique_cluster")
-    if cluster == "null" or cluster == "":
+    if cluster in ("null", ""):
         cluster = None
 
     confidence = data.get("cluster_assignment_confidence")
-    if confidence == "null" or confidence == "":
+    if confidence in ("null", ""):
         confidence = None
 
     secondary = data.get("secondary_sections") or []
@@ -283,7 +350,6 @@ def _apply_scoring(paper: PaperRecord, data: dict, config: Config) -> PaperRecor
         mission = None
 
     source_type_raw = data.get("source_type")
-    # Preserve source_type set at normalisation (e.g. "technical_report" for NTRS)
     source_type = paper.source_type or source_type_raw or None
 
     return paper.model_copy(
@@ -356,41 +422,42 @@ def _assign_inclusion_from_score(score: float, config: Config) -> str:
 
 def apply_auto_rules(records: list[PaperRecord], config: Config) -> list[PaperRecord]:
     """Apply auto-include and auto-exclude rules after scoring."""
-    result = []
-    for record in records:
-        result.append(_apply_rules(record, config))
-    return result
+    return [_apply_rules(r, config) for r in records]
 
 
 def _apply_rules(record: PaperRecord, config: Config) -> PaperRecord:
-    # 1. Auto-exclude first
     for rule in config.relevance_scoring.auto_exclude_rules:
         cond = rule.get("condition", "")
         if _eval_condition(cond, record):
             return record.model_copy(
                 update={
                     "inclusion_decision": "exclude",
-                    "agent_notes": f"{record.agent_notes or ''} [AUTO-EXCLUDED: {cond}]".strip(),
+                    "agent_notes": (
+                        f"{record.agent_notes or ''} [AUTO-EXCLUDED: {cond}]".strip()
+                    ),
                 }
             )
 
-    # 2. NASA/ESA NTRS technical reports — always include
     if record.source_database == "NASA Technical Reports Server":
         return record.model_copy(
             update={
                 "inclusion_decision": "include",
-                "agent_notes": f"{record.agent_notes or ''} [AUTO-INCLUDED: NASA NTRS mission document]".strip(),
+                "agent_notes": (
+                    f"{record.agent_notes or ''} "
+                    "[AUTO-INCLUDED: NASA NTRS mission document]".strip()
+                ),
             }
         )
 
-    # 3. Auto-include rules
     for rule in config.relevance_scoring.auto_include_rules:
         cond = rule.get("condition", "")
         if _eval_condition(cond, record):
             return record.model_copy(
                 update={
                     "inclusion_decision": "include",
-                    "agent_notes": f"{record.agent_notes or ''} [AUTO-INCLUDED: {cond}]".strip(),
+                    "agent_notes": (
+                        f"{record.agent_notes or ''} [AUTO-INCLUDED: {cond}]".strip()
+                    ),
                 }
             )
 
@@ -400,7 +467,6 @@ def _apply_rules(record: PaperRecord, config: Config) -> PaperRecord:
 def _eval_condition(condition: str, record: PaperRecord) -> bool:
     condition = condition.lower()
     if "uav" in condition or "drone" in condition:
-        # Auto-exclude if title contains UAV/drone without space/ground robot context
         title = record.title.lower()
         if any(w in title for w in ("uav ", "drone", "unmanned aerial")):
             if not any(

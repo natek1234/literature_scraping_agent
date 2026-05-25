@@ -111,6 +111,9 @@ warn_redundant_casts = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "--cov=src --cov-report=term-missing"
+markers = [
+    "integration: hits real external APIs — requires network access (may be slow)",
+]
 
 [tool.coverage.run]
 source = ["src"]

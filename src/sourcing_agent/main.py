@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from collections import defaultdict
@@ -10,7 +11,8 @@ from dotenv import load_dotenv
 from loguru import logger
 
 if TYPE_CHECKING:
-    from .config import Config
+    from .config import Config, DatabaseConfig
+    from .models import PaperRecord
 
 load_dotenv()
 
@@ -18,9 +20,49 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-8-s
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
 
-def _setup_logging(log_file: str) -> None:
-    import os
+# ── JSONL helpers (used for per-DB and dedup caches) ─────────────────────────
 
+
+def _save_jsonl(path: str, records: list[PaperRecord]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(r.model_dump_json() + "\n")
+
+
+def _load_jsonl(path: str) -> list[PaperRecord]:
+    from .models import PaperRecord as _PR
+
+    with open(path, encoding="utf-8") as f:
+        return [_PR.model_validate_json(line) for line in f if line.strip()]
+
+
+def _db_cache_path(out_dir: str, db_name: str) -> str:
+    slug = db_name.lower().replace(" ", "_")
+    return os.path.join(out_dir, f"papers-{slug}.jsonl")
+
+
+def _db_skip_note(db: DatabaseConfig) -> str:
+    """Return a short reason string when a browser DB returns 0 results."""
+    if db.type != "paywalled_browser":
+        return ""
+    cred = db.credential_env_vars
+    username = os.environ.get(cred.get("username", ""), "")
+    password = os.environ.get(cred.get("password", ""), "")
+    _PLACEHOLDERS = ("your_email", "your_password", "placeholder", "institution.edu")
+    if not username or not password:
+        return "no credentials in .env"
+    if any(p in username for p in _PLACEHOLDERS) or any(
+        p in password for p in _PLACEHOLDERS
+    ):
+        return "placeholder credentials — update .env"
+    return "access blocked or 0 results"
+
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+
+
+def _setup_logging(log_file: str) -> None:
     os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
     logger.remove()
     logger.add(
@@ -37,20 +79,27 @@ def _setup_logging(log_file: str) -> None:
     )
 
 
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
+
 async def run(context_path: str = "CONTEXT.md") -> None:
     from .config import Config
-    from .models import PaperRecord
     from .output.excel_writer import write_to_excel
     from .output.zotero_writer import write_to_zotero
     from .pipeline.deduplicator import deduplicate
     from .pipeline.query_builder import build_queries, build_supplementary_queries
     from .pipeline.scorer import apply_auto_rules, score_papers
     from .progress import ProgressTracker
+    from .summary import SummaryWriter
 
     config = Config.from_file(context_path)
     _setup_logging(config.output.log_file)
     progress = ProgressTracker(config.output.progress_file)
     progress.load_or_init(config.project_title)
+
+    out_dir = os.path.dirname(config.output.progress_file) or "./outputs"
+    summary = SummaryWriter(os.path.join(out_dir, "sourcing-summary.txt"))
+    summary.init(progress.run_id, config.project_title)
 
     start_time = time.time()
     all_records: list[PaperRecord] = []
@@ -62,29 +111,42 @@ async def run(context_path: str = "CONTEXT.md") -> None:
             "queries_built", {"clusters": len(config.keywords_tier_2)}
         )
     else:
-        queries = build_queries(config)  # Rebuild from config (no network calls)
+        queries = build_queries(config)
         logger.info("Queries rebuilt from config (step already complete)")
 
     n_queries = sum(len(v) for v in queries.values())
     logger.info(f"✓ Queries built: {n_queries} queries across {len(queries)} databases")
     logger.info(f"  Query log written to: {config.output.query_log}")
 
-    # ── Step 2: Query open-access databases ──────────────────────────────────
+    # ── Step 2: Query databases (per-DB cache for true resume) ───────────────
     from .databases import arxiv, nasa_ntrs, semantic_scholar
 
     for db in config.databases:
         if not db.enabled:
             continue
-        step_key = f"{db.name.lower().replace(' ', '_')}_queried"
 
-        if progress.is_step_complete(step_key):
-            logger.info(f"  {db.name}: already queried (skipping)")
-            continue
+        step_key = f"{db.name.lower().replace(' ', '_')}_queried"
+        db_cache = _db_cache_path(out_dir, db.name)
+
+        # Resume: load from cache when step is complete AND cache file exists
+        if progress.is_step_complete(step_key) and os.path.exists(db_cache):
+            try:
+                db_records = _load_jsonl(db_cache)
+                all_records.extend(db_records)
+                logger.info(
+                    f"  {db.name}: loaded {len(db_records):,} papers from cache "
+                    "(skipping re-query)"
+                )
+                summary.update_db(db.name, len(db_records), note="resumed from cache")
+                continue
+            except Exception as e:
+                logger.warning(f"  {db.name}: cache load failed ({e}) — re-querying")
+
+        # Query the database
+        db_records = []
+        db_queries = queries.get(db.name, [])
 
         if db.type == "open_access_api":
-            db_records: list[PaperRecord] = []
-            db_queries = queries.get(db.name, [])
-
             for q in db_queries:
                 try:
                     if db.name == "Semantic Scholar":
@@ -99,16 +161,8 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                 except Exception as e:
                     logger.error(f"{db.name}: query failed — {e}")
 
-            all_records.extend(db_records)
-            progress.log_prisma_count("identified", db.name, len(db_records))
-            progress.write_checkpoint(step_key, {"retrieved": len(db_records)})
-            logger.info(f"✓ {db.name}: {len(db_records)} results")
-
         elif db.type == "paywalled_browser":
             from .databases.browser_scraper import search as browser_search
-
-            db_records = []
-            db_queries = queries.get(db.name, [])
 
             for q in db_queries:
                 try:
@@ -117,89 +171,113 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                 except Exception as e:
                     logger.error(f"{db.name}: browser query failed — {e}")
 
-            all_records.extend(db_records)
-            progress.log_prisma_count("identified", db.name, len(db_records))
-            progress.write_checkpoint(step_key, {"retrieved": len(db_records)})
-            if db_records:
-                logger.info(f"✓ {db.name}: {len(db_records)} results")
-            else:
-                logger.info(f"  {db.name}: SKIPPED or 0 results")
+        # Persist to cache so this DB never needs re-querying on resume
+        _save_jsonl(db_cache, db_records)
+        all_records.extend(db_records)
+        progress.log_prisma_count("identified", db.name, len(db_records))
+        progress.write_checkpoint(step_key, {"retrieved": len(db_records)})
+
+        if db_records:
+            logger.info(f"✓ {db.name}: {len(db_records):,} results")
+            summary.update_db(db.name, len(db_records))
+        else:
+            note = _db_skip_note(db)
+            logger.info(f"  {db.name}: 0 results{f' ({note})' if note else ''}")
+            summary.update_db(db.name, 0, note=note)
 
     # ── Step 3: Deduplicate ───────────────────────────────────────────────────
-    _papers_cache = config.output.progress_file.replace(
-        "sourcing-progress.txt", "papers-deduped.jsonl"
-    )
-    if not progress.is_step_complete("deduplicated"):
-        before_dedup = len(all_records)
-        all_records = deduplicate(all_records, config)
-        import os as _os
+    dedup_cache = os.path.join(out_dir, "papers-deduped.jsonl")
 
-        _os.makedirs(_os.path.dirname(_papers_cache) or ".", exist_ok=True)
-        with open(_papers_cache, "w", encoding="utf-8") as _f:
-            for _r in all_records:
-                _f.write(_r.model_dump_json() + "\n")
+    if not progress.is_step_complete("deduplicated"):
+        before = len(all_records)
+        all_records = deduplicate(all_records, config)
+        removed = before - len(all_records)
+        _save_jsonl(dedup_cache, all_records)
         progress.log_prisma_count("after_dedup", "all", len(all_records))
         progress.write_checkpoint(
-            "deduplicated",
-            {
-                "unique": len(all_records),
-                "removed": before_dedup - len(all_records),
-            },
+            "deduplicated", {"unique": len(all_records), "removed": removed}
         )
         logger.info(
-            f"✓ Deduplication: {len(all_records)} unique papers "
-            f"(removed {before_dedup - len(all_records)} duplicates)"
+            f"✓ Deduplication: {len(all_records):,} unique papers "
+            f"(removed {removed:,} duplicates)"
         )
+        summary.update_dedup(len(all_records), removed)
     else:
-        import os as _os
-
-        if _os.path.exists(_papers_cache):
-            from .models import PaperRecord as _PR
-
-            with open(_papers_cache, encoding="utf-8") as _f:
-                all_records = [
-                    _PR.model_validate_json(line) for line in _f if line.strip()
-                ]
+        if os.path.exists(dedup_cache):
+            all_records = _load_jsonl(dedup_cache)
             logger.info(
-                f"  Deduplication: already complete — loaded {len(all_records)} papers from cache"
+                f"  Deduplication: already complete — "
+                f"loaded {len(all_records):,} papers from cache"
+            )
+            summary.update_dedup(
+                len(all_records),
+                sum(v.get("count", 0) for v in summary._db.values()) - len(all_records),
             )
         else:
             logger.warning(
-                "  Deduplication: marked complete but cache file missing — "
+                "  Deduplication: marked complete but cache missing — "
                 "re-running database queries is required"
             )
 
     # ── Step 4: Score ─────────────────────────────────────────────────────────
+    scored_cache = os.path.join(out_dir, "papers-scored.jsonl")
+
     if not progress.is_step_complete("scored"):
+        summary.update_scoring(
+            total=len(all_records),
+            scored=0,
+            include=0,
+            maybe=0,
+            exclude=0,
+            errors=0,
+        )
         progress.write_checkpoint("scoring", {"total": len(all_records)})
-        all_records = await score_papers(all_records, config, progress)
+        all_records = await score_papers(
+            all_records,
+            config,
+            progress,
+            summary=summary,
+            scored_cache=scored_cache,
+        )
         all_records = apply_auto_rules(all_records, config)
+
+        # Overwrite scored cache with post-auto-rules records
+        _save_jsonl(scored_cache, all_records)
+
         errors = sum(
-            1
-            for r in all_records
-            if r.agent_notes and "SCORING_ERROR" in (r.agent_notes or "")
+            1 for r in all_records if r.agent_notes and "SCORING_ERROR" in r.agent_notes
         )
         if errors == len(all_records) and errors > 0:
             logger.error(
-                f"All {errors} papers failed scoring — likely a missing ANTHROPIC_API_KEY. "
-                "Add ANTHROPIC_API_KEY to .env and re-run."
+                f"All {errors} papers failed scoring. "
+                "Likely cause: ANTHROPIC_API_KEY is missing from .env."
             )
         progress.write_checkpoint(
             "scored", {"total": len(all_records), "errors": errors}
         )
         logger.info(
-            f"✓ Scoring: {len(all_records)} papers scored ({errors} errors flagged for review)"
+            f"✓ Scoring: {len(all_records):,} papers scored "
+            f"({errors} errors flagged for review)"
         )
     else:
-        logger.info("  Scoring: already complete")
+        if os.path.exists(scored_cache):
+            all_records = _load_jsonl(scored_cache)
+            logger.info(
+                f"  Scoring: already complete — "
+                f"loaded {len(all_records):,} scored papers from cache"
+            )
+        else:
+            logger.warning(
+                "  Scoring: marked complete but scored cache missing — "
+                "continuing with in-memory records (scores may be lost)"
+            )
 
     # ── Step 5: Coverage check + supplementary queries ────────────────────────
     if not progress.is_step_complete("coverage_checked"):
         undercovered = _check_section_coverage(all_records, config)
         if undercovered:
             logger.info(
-                f"  Section undercoverage detected: {undercovered} — "
-                "running supplementary queries"
+                f"  Section undercoverage: {undercovered} — running supplementary queries"
             )
             for section_tag in undercovered:
                 supp_queries = build_supplementary_queries(section_tag, config)
@@ -209,7 +287,6 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                     supp_db = config.db_by_name(db_name)
                     if not supp_db or not supp_db.enabled:
                         continue
-                    db = supp_db
                     for q in db_qs:
                         try:
                             if db_name == "Semantic Scholar":
@@ -227,14 +304,15 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                 if supp_records:
                     all_records.extend(supp_records)
                     all_records = deduplicate(all_records, config)
-                    supp_scored = await score_papers(supp_records, config, progress)
+                    supp_scored = await score_papers(
+                        supp_records, config, progress, summary=summary
+                    )
                     supp_scored = apply_auto_rules(supp_scored, config)
-                    # Replace un-scored supplementary records with scored versions
                     supp_titles = {r.title for r in supp_scored}
                     all_records = [r for r in all_records if r.title not in supp_titles]
                     all_records.extend(supp_scored)
                     logger.info(
-                        f"  Supplementary: +{len(supp_scored)} records for {section_tag}"
+                        f"  Supplementary: +{len(supp_scored):,} records for {section_tag}"
                     )
 
         progress.write_checkpoint("coverage_checked", {"undercovered": undercovered})
@@ -246,33 +324,45 @@ async def run(context_path: str = "CONTEXT.md") -> None:
     if not progress.is_step_complete("zotero_written"):
         if config.output.zotero.enabled:
             try:
+                summary.update_zotero("writing...")
                 n_written = write_to_zotero(all_records, config)
                 progress.write_checkpoint("zotero_written", {"written": n_written})
-                logger.info(f"✓ Zotero: {n_written} papers written")
+                logger.info(f"✓ Zotero: {n_written:,} papers written")
+                summary.update_zotero(f"complete ({n_written:,} papers)")
             except Exception as e:
                 logger.error(f"Zotero write failed — {e} — falling back to Excel only")
+                summary.update_zotero(f"FAILED: {e}")
         else:
             logger.info("  Zotero: disabled in config")
+            summary.update_zotero("disabled")
     else:
         logger.info("  Zotero: already written")
+        summary.update_zotero("already written (previous run)")
 
     # ── Step 8: Write to Excel ────────────────────────────────────────────────
     if not progress.is_step_complete("excel_written"):
         try:
+            summary.update_excel("writing...")
             write_to_excel(all_records, config)
             progress.write_checkpoint(
                 "excel_written", {"path": config.output.excel.path}
             )
             logger.info(f"✓ Excel: written to {config.output.excel.path}")
+            summary.update_excel(f"complete — {config.output.excel.path}")
         except Exception as e:
             logger.error(f"Excel write failed — {e}")
+            summary.update_excel(f"FAILED: {e}")
     else:
         logger.info("  Excel: already written")
+        summary.update_excel("already written (previous run)")
 
     # ── Results tallies ───────────────────────────────────────────────────────
     n_include = sum(1 for r in all_records if r.inclusion_decision == "include")
     n_maybe = sum(1 for r in all_records if r.inclusion_decision == "maybe")
     n_exclude = sum(1 for r in all_records if r.inclusion_decision == "exclude")
+    n_errors = sum(
+        1 for r in all_records if r.agent_notes and "SCORING_ERROR" in r.agent_notes
+    )
 
     by_kunze: dict[str, int] = defaultdict(int)
     for r in all_records:
@@ -283,6 +373,16 @@ async def run(context_path: str = "CONTEXT.md") -> None:
     for r in all_records:
         if r.cluster_assignment_confidence:
             conf_counts[r.cluster_assignment_confidence] += 1
+
+    summary.update_scoring(
+        total=len(all_records),
+        scored=len(all_records),
+        include=n_include,
+        maybe=n_maybe,
+        exclude=n_exclude,
+        errors=n_errors,
+    )
+    summary.mark_complete()
 
     progress.update_results(
         include=n_include,
@@ -313,24 +413,20 @@ async def run(context_path: str = "CONTEXT.md") -> None:
 def _check_section_coverage(records: list[Any], config: Config) -> list[str]:
     included = [r for r in records if r.inclusion_decision == "include"]
     undercovered: list[str] = []
-
     for _tag, sec in config.paper_structure.items():
-        target_min = sec.target_min
         count = sum(
             1
             for r in included
             if sec.section_tag in [r.primary_section, *r.secondary_sections]
         )
-        if count < target_min * config.edge_cases.section_undercoverage_threshold:
+        if count < sec.target_min * config.edge_cases.section_undercoverage_threshold:
             undercovered.append(sec.section_tag)
-
     return undercovered
 
 
 def _print_coverage(records: list[Any], config: Config) -> None:
     included = [r for r in records if r.inclusion_decision == "include"]
     print("\n✓ Section coverage check:")
-
     target_map = {
         "S1:introduction": "10-20",
         "S2:history": "25-40",
@@ -349,7 +445,6 @@ def _print_coverage(records: list[Any], config: Config) -> None:
         "S5c:integration-protocols": "10-20",
         "S6:future-directions": "15-25",
     }
-
     for sec_tag, target in target_map.items():
         count = sum(
             1 for r in included if sec_tag in [r.primary_section, *r.secondary_sections]
@@ -384,11 +479,11 @@ def _print_final_summary(
   Project: {config.project_title}
   Run time: {mins}m {secs}s
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Candidates retrieved (total):  {len(records)}
+  Candidates retrieved (total):  {len(records):,}
 
-  INCLUDED:  {n_include} papers  →  Zotero + Excel
-  MAYBE:     {n_maybe} papers  →  Zotero + Excel (flagged for review)
-  EXCLUDED:  {n_exclude} papers  →  Excel only
+  INCLUDED:  {n_include:,} papers  →  Zotero + Excel
+  MAYBE:     {n_maybe:,} papers  →  Zotero + Excel (flagged for review)
+  EXCLUDED:  {n_exclude:,} papers  →  Excel only
 
   By Kunze dimension (included + maybe):
     D1 Navigation & Mapping:         {by_kunze.get('D1', 0)}
@@ -407,6 +502,7 @@ def _print_final_summary(
   Outputs:
     Zotero collection:  {config.output.zotero.collection_name}
     Excel file:         {config.output.excel.path}
+    Summary file:       {os.path.join(os.path.dirname(config.output.progress_file) or './outputs', 'sourcing-summary.txt')}
     Query log:          {config.output.query_log}
     Progress file:      {config.output.progress_file}
     Run log:            {config.output.log_file}
