@@ -2,9 +2,11 @@
 
 Run with:  pytest tests/databases/test_semantic_scholar.py -v -m integration
 
-Without an S2_API_KEY the public API returns HTTP 403 after a small number
-of requests. Tests that require a key are skipped automatically when the key
-is absent. Add S2_API_KEY to .env to unlock the full test suite.
+Without an S2_API_KEY the public API returns HTTP 429 (Too Many Requests)
+after a small number of requests — S2 moved from 403 to 429 for keyless
+IP rate-limiting in 2024. Tests that require a key are skipped automatically
+when the key is absent. Add S2_API_KEY to .env to unlock the full test suite.
+Get a free key at https://www.semanticscholar.org/product/api
 """
 
 from __future__ import annotations
@@ -29,11 +31,11 @@ def _has_api_key() -> bool:
 
 @pytest.mark.asyncio
 async def test_s2_api_reachable() -> None:
-    """Semantic Scholar API endpoint is reachable (HTTP 200 or 403 expected).
+    """Semantic Scholar API endpoint is reachable (HTTP 200, 403, or 429 expected).
 
-    A 403 without an API key is normal and not treated as a failure here —
-    it confirms the endpoint exists and is responding. Any other error
-    (connection refused, DNS failure, timeout) is a genuine failure.
+    Without an API key S2 now returns 429 (IP rate-limited) rather than 403.
+    Both are normal and confirm the endpoint is responding — neither is treated
+    as a test failure. Any other status or connection error is a genuine problem.
     """
     params = {"query": _QUERY, "fields": "title", "limit": 1}
 
@@ -54,39 +56,47 @@ async def test_s2_api_reachable() -> None:
                 f"  Cause : {exc}"
             )
 
-    assert resp.status_code in (200, 403), (
+    assert resp.status_code in (200, 403, 429), (
         f"Unexpected HTTP status {resp.status_code} from Semantic Scholar.\n"
-        f"  Expected 200 (with key) or 403 (IP-rate-limited, no key).\n"
+        f"  Expected : 200 (success), 403 (query rejected), or 429 (IP rate-limited).\n"
+        f"  429 means you are hitting the keyless rate limit — add S2_API_KEY to .env.\n"
         f"  URL      : {resp.url}\n"
         f"  Response : {resp.text[:400]}"
     )
 
 
 @pytest.mark.asyncio
-async def test_s2_403_without_key_does_not_crash(config) -> None:
-    """Without S2_API_KEY, search() returns [] and does not raise."""
+async def test_s2_rate_limited_without_key_does_not_crash(config) -> None:
+    """Without S2_API_KEY, search() returns [] promptly and does not raise.
+
+    S2 now returns 429 (not 403) when the keyless IP rate limit is exceeded.
+    The client must fast-fail on the first 429 without an API key — retrying
+    with exponential backoff is futile since the limit won't clear quickly.
+    This test should complete in under 5 seconds; if it hangs, the fast-fail
+    path in _fetch_with_retry is broken.
+    """
     if _has_api_key():
         pytest.skip("S2_API_KEY is set — test targets keyless behaviour only")
 
     from sourcing_agent.databases.semantic_scholar import search
 
-    # Should return [] gracefully, not raise
     try:
         records = await search(_QUERY, config)
     except Exception as exc:
         pytest.fail(
-            f"search() raised an exception when S2 returned 403.\n"
+            f"search() raised an exception when S2 returned 429.\n"
             f"  Exception type : {type(exc).__name__}\n"
             f"  Message        : {exc}\n"
             f"  Expected       : empty list [], not an exception.\n"
-            f"  Fix            : ensure _fetch_with_retry handles 403 by returning None."
+            f"  Fix            : _fetch_with_retry must return None on 429 "
+            f"when has_key=False."
         )
 
     assert isinstance(
         records, list
     ), f"search() returned {type(records).__name__} instead of list."
-    # With a fresh IP and no key we expect 0 (403) or a small number (if lucky)
-    assert len(records) >= 0  # always true — validates no crash
+    # 429 without a key → 0 results; occasionally 200 if not yet rate-limited
+    assert len(records) >= 0  # always true — validates no crash, not result count
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,8 @@ async def search(query: str, config: Config) -> list[PaperRecord]:
     offset = 0
     limit = min(100, max_results)
 
+    has_key = bool(api_key)
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         while offset < max_results:
             params = {
@@ -41,7 +43,7 @@ async def search(query: str, config: Config) -> list[PaperRecord]:
                 "limit": limit,
                 "offset": offset,
             }
-            response = await _fetch_with_retry(client, params, headers)
+            response = await _fetch_with_retry(client, params, headers, has_key=has_key)
             if response is None:
                 break
 
@@ -70,14 +72,26 @@ async def _fetch_with_retry(
     client: httpx.AsyncClient,
     params: dict,
     headers: dict,
+    has_key: bool = False,
 ) -> httpx.Response | None:
-    for attempt in range(5):
+    # Without an API key a 429 is an IP-level rate limit that won't clear
+    # with retries — bail immediately. With a key, use exponential backoff.
+    max_attempts = 5 if has_key else 1
+    for attempt in range(max_attempts):
         try:
             resp = await client.get(BASE_URL, params=params, headers=headers)
             if resp.status_code == 429:
+                if not has_key:
+                    logger.warning(
+                        "Semantic Scholar: 429 — IP rate-limited without API key. "
+                        "Add S2_API_KEY to .env to raise the limit (free key available at "
+                        "https://www.semanticscholar.org/product/api)."
+                    )
+                    return None
                 wait = min(30 * (2**attempt), 120)
                 logger.warning(
-                    f"Semantic Scholar: 429 rate limit — waiting {wait}s (attempt {attempt+1})"
+                    f"Semantic Scholar: 429 rate limit — waiting {wait}s "
+                    f"(attempt {attempt + 1}/{max_attempts})"
                 )
                 await asyncio.sleep(wait)
                 continue
@@ -92,7 +106,7 @@ async def _fetch_with_retry(
         except Exception as e:
             logger.error(f"Semantic Scholar request error: {e}")
             return None
-    logger.error("Semantic Scholar: max retries reached")
+    logger.error("Semantic Scholar: max retries reached — add S2_API_KEY to .env")
     return None
 
 
