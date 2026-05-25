@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -83,6 +84,66 @@ def test_playwright_importable() -> None:
             "  Fix: python -m playwright install chromium --with-deps\n"
             "  Or:  pip install playwright && playwright install chromium"
         )
+
+
+# ── Website reachability (no credentials required) ───────────────────────────
+#
+# These probe the public login/search page of each database using a plain HTTP
+# GET — no Playwright, no credentials. They confirm the host is reachable from
+# this network and that the service is responding. Any HTTP status in the 2xx,
+# 3xx, or 4xx range counts as reachable; only connection failures or timeouts
+# are treated as genuine problems (the sites may redirect or gate on IP).
+
+_SITE_URLS: dict[str, str] = {
+    "IEEE Xplore": "https://ieeexplore.ieee.org/search/searchresult.jsp",
+    "Web of Science": "https://www.webofscience.com/wos/woscc/basic-search",
+    "Scopus": "https://www.scopus.com/search/form.uri",
+    "ACM Digital Library": "https://dl.acm.org/search/",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db_name", list(_SITE_URLS.keys()))
+async def test_site_reachable(db_name: str) -> None:
+    """The database website is reachable from this network.
+
+    Uses a plain HTTP GET — no Playwright, no credentials. Any HTTP status
+    in the 2xx-4xx range is accepted as "reachable"; only a connection error
+    or timeout indicates a real network problem.
+
+    A 403 or 401 means the site responded but requires authentication — that
+    is expected and is not a failure. A 503 or timeout may indicate a service
+    outage worth investigating.
+    """
+    url = _SITE_URLS[db_name]
+
+    async with httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"},
+    ) as client:
+        try:
+            resp = await client.get(url)
+        except httpx.ConnectError as exc:
+            pytest.fail(
+                f"{db_name}: cannot reach {url}\n"
+                f"  Cause : {exc}\n"
+                f"  Check : network connectivity, DNS, and firewall rules.\n"
+                f"  Note  : institutional VPN or proxy may be required."
+            )
+        except httpx.TimeoutException as exc:
+            pytest.fail(
+                f"{db_name}: request to {url} timed out after 30 s.\n"
+                f"  Cause : {exc}\n"
+                f"  Check : {db_name} service status or network latency."
+            )
+
+    assert resp.status_code < 500, (
+        f"{db_name}: server error {resp.status_code} — service may be down.\n"
+        f"  URL      : {resp.url}\n"
+        f"  Response : {resp.text[:300]}\n"
+        f"  A 5xx here is unexpected; 4xx (auth required) is normal."
+    )
 
 
 # ── Missing-credential fast-fail ──────────────────────────────────────────────
