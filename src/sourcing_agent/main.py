@@ -126,9 +126,18 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                 logger.info(f"  {db.name}: SKIPPED or 0 results")
 
     # ── Step 3: Deduplicate ───────────────────────────────────────────────────
+    _papers_cache = config.output.progress_file.replace(
+        "sourcing-progress.txt", "papers-deduped.jsonl"
+    )
     if not progress.is_step_complete("deduplicated"):
         before_dedup = len(all_records)
         all_records = deduplicate(all_records, config)
+        import os as _os
+
+        _os.makedirs(_os.path.dirname(_papers_cache) or ".", exist_ok=True)
+        with open(_papers_cache, "w", encoding="utf-8") as _f:
+            for _r in all_records:
+                _f.write(_r.model_dump_json() + "\n")
         progress.log_prisma_count("after_dedup", "all", len(all_records))
         progress.write_checkpoint(
             "deduplicated",
@@ -142,9 +151,23 @@ async def run(context_path: str = "CONTEXT.md") -> None:
             f"(removed {before_dedup - len(all_records)} duplicates)"
         )
     else:
-        logger.info(
-            f"  Deduplication: already complete ({len(all_records)} records in memory)"
-        )
+        import os as _os
+
+        if _os.path.exists(_papers_cache):
+            from .models import PaperRecord as _PR
+
+            with open(_papers_cache, encoding="utf-8") as _f:
+                all_records = [
+                    _PR.model_validate_json(line) for line in _f if line.strip()
+                ]
+            logger.info(
+                f"  Deduplication: already complete — loaded {len(all_records)} papers from cache"
+            )
+        else:
+            logger.warning(
+                "  Deduplication: marked complete but cache file missing — "
+                "re-running database queries is required"
+            )
 
     # ── Step 4: Score ─────────────────────────────────────────────────────────
     if not progress.is_step_complete("scored"):
@@ -156,6 +179,11 @@ async def run(context_path: str = "CONTEXT.md") -> None:
             for r in all_records
             if r.agent_notes and "SCORING_ERROR" in (r.agent_notes or "")
         )
+        if errors == len(all_records) and errors > 0:
+            logger.error(
+                f"All {errors} papers failed scoring — likely a missing ANTHROPIC_API_KEY. "
+                "Add ANTHROPIC_API_KEY to .env and re-run."
+            )
         progress.write_checkpoint(
             "scored", {"total": len(all_records), "errors": errors}
         )
