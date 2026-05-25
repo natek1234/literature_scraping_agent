@@ -190,6 +190,53 @@ async def score_papers(
         logger.info("All papers already scored — nothing to do")
         return all_scored
 
+    # ── No API key: defer all remaining papers to manual scoring ─────────────
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.warning(
+            "ANTHROPIC_API_KEY not set — deferring %d papers to "
+            "PENDING_MANUAL_SCORING. Run /score-pending in a Claude Code "
+            "session to score them interactively (no API key required).",
+            remaining,
+        )
+        pending_fh = None
+        if scored_cache:
+            os.makedirs(os.path.dirname(scored_cache) or ".", exist_ok=True)
+            pending_fh = open(scored_cache, "a", encoding="utf-8")
+        try:
+            for paper in records[start_idx:]:
+                stub = paper.model_copy(
+                    update={
+                        "inclusion_decision": "maybe",
+                        "agent_notes": "PENDING_MANUAL_SCORING",
+                        "section_fit_score": 0.0,
+                        "contribution_score": 0.0,
+                        "recency_score": 0.0,
+                        "weighted_score": 0.0,
+                    }
+                )
+                all_scored.append(stub)
+                if pending_fh:
+                    pending_fh.write(stub.model_dump_json() + "\n")
+            if pending_fh:
+                pending_fh.flush()
+        finally:
+            if pending_fh:
+                pending_fh.close()
+
+        if summary is not None:
+            n_pending = sum(
+                1 for r in all_scored if r.agent_notes == "PENDING_MANUAL_SCORING"
+            )
+            summary.update_scoring(
+                total=len(records),
+                scored=len(all_scored),
+                include=0,
+                maybe=n_pending,
+                exclude=0,
+                errors=0,
+            )
+        return all_scored
+
     logger.info(
         f"Scoring {remaining} papers in batches of {batch_size}"
         + (f" (resuming from index {start_idx})" if start_idx else "")
@@ -462,6 +509,61 @@ def _apply_rules(record: PaperRecord, config: Config) -> PaperRecord:
             )
 
     return record
+
+
+def apply_session_scores(
+    jsonl_path: str,
+    session_results: list[dict],
+    config: Config,
+) -> int:
+    """Apply scoring data from a /score-pending session to the JSONL cache.
+
+    Reads jsonl_path, finds records whose agent_notes is 'PENDING_MANUAL_SCORING',
+    matches them to entries in session_results by normalised title, applies
+    _apply_scoring + _apply_rules, then rewrites the file in place.
+
+    session_results: list of dicts matching the _USER_TEMPLATE JSON schema,
+    each with a 'title' key for matching.
+    Returns the number of records updated.
+    """
+    if not os.path.exists(jsonl_path):
+        logger.error(f"apply_session_scores: JSONL not found: {jsonl_path}")
+        return 0
+
+    records: list[PaperRecord] = []
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(PaperRecord.model_validate_json(line))
+
+    # Build a normalised-title → scoring-data lookup
+    lookup: dict[str, dict] = {}
+    for d in session_results:
+        key = d.get("title", "").lower().strip()
+        if key:
+            lookup[key] = d
+
+    updated = 0
+    result: list[PaperRecord] = []
+    for record in records:
+        if record.agent_notes == "PENDING_MANUAL_SCORING":
+            key = record.title.lower().strip()
+            if key in lookup:
+                scored = _apply_scoring(record, lookup[key], config)
+                scored = _apply_rules(scored, config)
+                result.append(scored)
+                updated += 1
+                continue
+        result.append(record)
+
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for r in result:
+            f.write(r.model_dump_json() + "\n")
+
+    logger.info(
+        f"apply_session_scores: updated {updated}/{len(records)} records in {jsonl_path}"
+    )
+    return updated
 
 
 def _eval_condition(condition: str, record: PaperRecord) -> bool:

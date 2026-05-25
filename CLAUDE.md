@@ -27,6 +27,7 @@ it serves. Read `CONTEXT.md` and `PIPELINE_SPEC.md` before writing any code.
 | `/setup-env` | Once, on a new machine before first run |
 | `/source-papers` | Start a new full sourcing run |
 | `/resume-run` | Resume an interrupted sourcing session |
+| `/score-pending` | Score PENDING_MANUAL_SCORING papers interactively (no API key needed) |
 | `/save-progress` | After completing any meaningful unit of work |
 | `/open-pr` | When a feature branch is ready for review |
 
@@ -48,6 +49,7 @@ it serves. Read `CONTEXT.md` and `PIPELINE_SPEC.md` before writing any code.
 │       ├── setup-env/SKILL.md       ← /setup-env slash command
 │       ├── resume-run/SKILL.md      ← /resume-run slash command
 │       ├── save-progress/SKILL.md   ← /save-progress slash command
+│       ├── score-pending/SKILL.md   ← /score-pending slash command
 │       └── open-pr/SKILL.md         ← /open-pr slash command
 ├── src/
 │   └── sourcing_agent/
