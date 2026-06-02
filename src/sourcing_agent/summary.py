@@ -129,11 +129,20 @@ class SummaryWriter:
                 lines.append(f"  {name:<{name_w}}  {'—':>{count_w}}    pending")
                 continue
             info = self._db[name]
-            count_str = f"{info['count']:,}" if info["count"] else "0"
-            note = f"  ({info['note']})" if info["note"] else ""
-            lines.append(
-                f"  {name:<{name_w}}  {count_str:>{count_w}}    complete{note}"
-            )
+            note: str = info.get("note", "") or ""
+            count: int = info["count"]
+            count_str = f"{count:,}" if count else "0"
+
+            if "skipped — add credentials" in note:
+                status = f"SKIPPED  ({note})"
+            elif "resumed from cache" in note:
+                status = f"cached   {count_str} papers"
+            elif count > 0:
+                status = f"OK       {count_str} papers"
+            else:
+                status = f"0 results  ({note})" if note else "0 results"
+
+            lines.append(f"  {name:<{name_w}}  {status}")
 
         lines.append("  " + "-" * (name_w + count_w + 14))
         lines.append(f"  {'Raw total':<{name_w}}  {self._raw_total:>{count_w},}")

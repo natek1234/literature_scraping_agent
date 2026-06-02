@@ -90,6 +90,7 @@ async def test_ntrs_response_is_json_when_accessible() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_ntrs_search_returns_records_when_accessible(config) -> None:
     """search() returns a non-empty list of PaperRecord objects when NTRS is open."""
     from sourcing_agent.databases.nasa_ntrs import search
@@ -121,6 +122,7 @@ async def test_ntrs_search_returns_records_when_accessible(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_ntrs_records_tagged_as_technical_reports_when_accessible(config) -> None:
     """NTRS records should have source_type='technical_report' and source_database set."""
     from sourcing_agent.databases.nasa_ntrs import search

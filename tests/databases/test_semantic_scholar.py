@@ -100,6 +100,7 @@ async def test_s2_rate_limited_without_key_does_not_crash(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_s2_search_returns_records_with_key(config) -> None:
     """With S2_API_KEY, search() returns a non-empty list of PaperRecords."""
     if not _has_api_key():
@@ -128,6 +129,7 @@ async def test_s2_search_returns_records_with_key(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_s2_records_have_titles_with_key(config) -> None:
     """With S2_API_KEY, all returned records have non-empty titles."""
     if not _has_api_key():
@@ -150,6 +152,7 @@ async def test_s2_records_have_titles_with_key(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_s2_citation_counts_populated_with_key(config) -> None:
     """With S2_API_KEY, citation counts should be populated on most records."""
     if not _has_api_key():
@@ -172,6 +175,7 @@ async def test_s2_citation_counts_populated_with_key(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_s2_rate_limit_recovery(config) -> None:
     """search() survives a 429 by backing off rather than crashing."""
     if not _has_api_key():

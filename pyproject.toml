@@ -113,6 +113,7 @@ asyncio_mode = "auto"
 addopts = "--cov=src --cov-report=term-missing"
 markers = [
     "integration: hits real external APIs — requires network access (may be slow)",
+    "live: verified a real connection and returned data (not just a credential-gated skip)",
 ]
 
 [tool.coverage.run]

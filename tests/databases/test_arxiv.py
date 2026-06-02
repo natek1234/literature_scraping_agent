@@ -76,6 +76,7 @@ async def test_arxiv_response_is_atom_xml() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_arxiv_search_returns_records(config) -> None:
     """search() returns a non-empty list of PaperRecord objects."""
     from sourcing_agent.databases.arxiv import search
@@ -96,6 +97,7 @@ async def test_arxiv_search_returns_records(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_arxiv_records_have_required_fields(config) -> None:
     """Every record has a non-empty title and source_database = 'arXiv'."""
     from sourcing_agent.databases.arxiv import search
@@ -119,6 +121,7 @@ async def test_arxiv_records_have_required_fields(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_arxiv_records_have_arxiv_ids(config) -> None:
     """Most records should carry an arxiv_id (e.g. '2301.12345')."""
     from sourcing_agent.databases.arxiv import search
@@ -163,6 +166,7 @@ async def test_arxiv_category_filter_applied(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_arxiv_abstracts_populated(config) -> None:
     """A large majority of records should have non-empty abstracts."""
     from sourcing_agent.databases.arxiv import search

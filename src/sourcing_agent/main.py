@@ -42,6 +42,24 @@ def _db_cache_path(out_dir: str, db_name: str) -> str:
     return os.path.join(out_dir, f"papers-{slug}.jsonl")
 
 
+_CRED_PLACEHOLDERS = ("your_email", "your_password", "placeholder", "institution.edu")
+
+
+def _browser_creds_available(db: DatabaseConfig) -> bool:
+    """Return True when real (non-placeholder) credentials exist for a paywalled DB."""
+    if db.type != "paywalled_browser":
+        return True
+    cred = db.credential_env_vars
+    username = os.environ.get(cred.get("username", ""), "")
+    password = os.environ.get(cred.get("password", ""), "")
+    if not username or not password:
+        return False
+    return not (
+        any(p in username for p in _CRED_PLACEHOLDERS)
+        or any(p in password for p in _CRED_PLACEHOLDERS)
+    )
+
+
 def _db_skip_note(db: DatabaseConfig) -> str:
     """Return a short reason string when a browser DB returns 0 results."""
     if db.type != "paywalled_browser":
@@ -49,11 +67,10 @@ def _db_skip_note(db: DatabaseConfig) -> str:
     cred = db.credential_env_vars
     username = os.environ.get(cred.get("username", ""), "")
     password = os.environ.get(cred.get("password", ""), "")
-    _PLACEHOLDERS = ("your_email", "your_password", "placeholder", "institution.edu")
     if not username or not password:
         return "no credentials in .env"
-    if any(p in username for p in _PLACEHOLDERS) or any(
-        p in password for p in _PLACEHOLDERS
+    if any(p in username for p in _CRED_PLACEHOLDERS) or any(
+        p in password for p in _CRED_PLACEHOLDERS
     ):
         return "placeholder credentials — update .env"
     return "access blocked or 0 results"
@@ -121,6 +138,10 @@ async def run(context_path: str = "CONTEXT.md") -> None:
     # ── Step 2: Query databases (per-DB cache for true resume) ───────────────
     from .databases import arxiv, nasa_ntrs, semantic_scholar
 
+    # True whenever any DB is freshly queried this session (not from cache).
+    # Used below to invalidate a stale dedup cache so new records aren't lost.
+    any_db_newly_queried = False
+
     for db in config.databases:
         if not db.enabled:
             continue
@@ -141,6 +162,19 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                 continue
             except Exception as e:
                 logger.warning(f"  {db.name}: cache load failed ({e}) — re-querying")
+
+        # Skip paywalled DBs that have no credentials — do NOT save cache or mark
+        # the step complete so that adding credentials later and resuming will
+        # re-query this DB rather than loading an empty cache.
+        if db.type == "paywalled_browser" and not _browser_creds_available(db):
+            logger.warning(
+                f"  {db.name}: skipped — credentials missing from .env "
+                "(add credentials and re-run to query this database)"
+            )
+            summary.update_db(
+                db.name, 0, note="skipped — add credentials to .env and resume"
+            )
+            continue
 
         # Query the database
         db_records = []
@@ -176,6 +210,7 @@ async def run(context_path: str = "CONTEXT.md") -> None:
         all_records.extend(db_records)
         progress.log_prisma_count("identified", db.name, len(db_records))
         progress.write_checkpoint(step_key, {"retrieved": len(db_records)})
+        any_db_newly_queried = True
 
         if db_records:
             logger.info(f"✓ {db.name}: {len(db_records):,} results")
@@ -187,6 +222,15 @@ async def run(context_path: str = "CONTEXT.md") -> None:
 
     # ── Step 3: Deduplicate ───────────────────────────────────────────────────
     dedup_cache = os.path.join(out_dir, "papers-deduped.jsonl")
+
+    # If any DB was freshly queried this session, the stale dedup cache is
+    # incomplete — the new records were never included. Invalidate it so the
+    # full all_records list (old + new) is deduped together.
+    if any_db_newly_queried and progress.is_step_complete("deduplicated"):
+        logger.info(
+            "  Deduplication: invalidating stale cache — new database results arrived"
+        )
+        progress.invalidate_step("deduplicated")
 
     if not progress.is_step_complete("deduplicated"):
         before = len(all_records)

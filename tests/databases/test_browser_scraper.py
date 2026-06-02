@@ -271,6 +271,7 @@ async def test_placeholder_proxy_url_skips_gracefully(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_ieee_search_with_credentials(config) -> None:
     """With IEEE credentials, search() returns a list of PaperRecord objects.
 
@@ -310,6 +311,7 @@ async def test_ieee_search_with_credentials(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_wos_search_with_credentials(config) -> None:
     """With Web of Science credentials, search() returns a list of PaperRecord objects.
 
@@ -347,6 +349,7 @@ async def test_wos_search_with_credentials(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_scopus_search_with_credentials(config) -> None:
     """With Scopus credentials, search() returns a list of PaperRecord objects.
 
@@ -384,6 +387,7 @@ async def test_scopus_search_with_credentials(config) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live
 async def test_acm_search_with_credentials(config) -> None:
     """With ACM credentials, search() returns a list of PaperRecord objects.
 

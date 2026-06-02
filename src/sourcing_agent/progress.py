@@ -90,6 +90,15 @@ class ProgressTracker:
         data = self._load()
         return bool(data.get("STEPS_COMPLETED", {}).get(step, False))
 
+    def invalidate_step(self, step: str) -> None:
+        """Remove a step from STEPS_COMPLETED so it will be re-run."""
+        self._data = self._load()
+        steps = self._data.get("STEPS_COMPLETED", {})
+        steps.pop(step, None)
+        self._data["STEPS_COMPLETED"] = steps
+        self._save(self._data)
+        logger.debug(f"Step invalidated: {step}")
+
     def log_prisma_count(self, stage: str, db: str, count: int) -> None:
         self._data = self._load()
         if "PRISMA" not in self._data:
