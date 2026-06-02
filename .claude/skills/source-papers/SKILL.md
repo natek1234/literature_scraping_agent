@@ -43,9 +43,15 @@ agent's working memory — it is required by `scorer.py` at scoring time.
 **Check 2 — Python environment**
 ```bash
 python --version   # require 3.11+
-python -c "import anthropic, requests, aiohttp, httpx, tenacity, \
+python -c "import openai, groq, requests, aiohttp, httpx, tenacity, \
            playwright, openpyxl, pyzotero, rapidfuzz, loguru, \
-           dotenv, yaml, pydantic"
+           dotenv, yaml, pydantic, pandas"
+python -c "from src.sourcing_agent.llm_backend import get_backend_info; \
+           info = get_backend_info(); \
+           print(f'Scorer backend:   {info[\"scorer_backend\"]} ({info[\"scorer_model\"]})'); \
+           print(f'Analysis backend: {info[\"analysis_backend\"]} ({info[\"analysis_model\"]})'); \
+           print(f'Ollama available: {info[\"ollama_available\"]}'); \
+           print(f'Groq available:   {info[\"groq_available\"]}')"
 ```
 If any import fails: `pip install -e ".[dev]" --break-system-packages`
 
@@ -76,6 +82,22 @@ z = zotero.Zotero(os.environ['ZOTERO_LIBRARY_ID'], 'user',
 print(f'Zotero OK — {z.count_items()} items in library')
 "
 ```
+
+**Check 7 — LLM Backend Verification**
+```bash
+python -c "from src.sourcing_agent.llm_backend import get_backend_info; \
+           info = get_backend_info(); \
+           print(f'Scorer backend:   {info[\"scorer_backend\"]} ({info[\"scorer_model\"]})'); \
+           print(f'Analysis backend: {info[\"analysis_backend\"]} ({info[\"analysis_model\"]})'); \
+           print(f'Ollama available: {info[\"ollama_available\"]}'); \
+           print(f'Groq available:   {info[\"groq_available\"]}')"
+```
+If Ollama is not available AND `GROQ_API_KEY` is not set, stop and tell the user:
+"No LLM backend is available for scoring. You need at least one of:
+- Ollama running locally (pull qwen2.5:7b and start with: ollama serve)
+- A Groq API key set as GROQ_API_KEY in .env (free at console.groq.com)
+Set SCORER_BACKEND in .env to 'ollama' or 'groq' accordingly."
+If at least one backend is available, print its details and continue.
 
 Print pre-flight summary:
 ```

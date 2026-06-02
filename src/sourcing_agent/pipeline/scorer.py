@@ -5,26 +5,15 @@ import json
 import os
 from typing import TYPE_CHECKING
 
-import anthropic
 from loguru import logger
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
+from ..llm_backend import ScoringBackendError, call_scorer, get_backend_info
 from ..models import PaperRecord
 
 if TYPE_CHECKING:
     from ..config import Config
     from ..progress import ProgressTracker
     from ..summary import SummaryWriter
-
-_SYSTEM_PROMPT = """\
-You are a research librarian screening papers for a systematic literature review.
-Score and tag each paper based on the criteria below.
-Return ONLY valid JSON — no preamble, no markdown fences, no trailing text."""
 
 _USER_TEMPLATE = """\
 REVIEW TITLE: {project_title}
@@ -141,16 +130,6 @@ Return ONLY this JSON (no other text):
   "agent_notes": "<one sentence: why this primary section? summarise scores>"
 }}"""
 
-_CLIENT: anthropic.AsyncAnthropic | None = None
-_MODEL = "claude-sonnet-4-6"
-
-
-def _get_client() -> anthropic.AsyncAnthropic:
-    global _CLIENT
-    if _CLIENT is None:
-        _CLIENT = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-    return _CLIENT
-
 
 async def score_papers(
     records: list[PaperRecord],
@@ -190,12 +169,23 @@ async def score_papers(
         logger.info("All papers already scored — nothing to do")
         return all_scored
 
-    # ── No API key: defer all remaining papers to manual scoring ─────────────
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    # ── Check backend availability ────────────────────────────────────────────
+    info = get_backend_info()
+    backend = info["scorer_backend"]
+    can_score = (
+        (backend == "anthropic" and info["anthropic_available"])
+        or (backend == "groq" and info["groq_available"])
+        or (
+            backend == "ollama" and (info["ollama_available"] or info["groq_available"])
+        )
+    )
+    sem = asyncio.Semaphore(info["scorer_parallel"])
+
+    if not can_score:
         logger.warning(
-            "ANTHROPIC_API_KEY not set — deferring %d papers to "
-            "PENDING_MANUAL_SCORING. Run /score-pending in a Claude Code "
-            "session to score them interactively (no API key required).",
+            "No LLM backend available for scoring — deferring %d papers to "
+            "PENDING_MANUAL_SCORING. Configure a backend in .env: "
+            "SCORER_BACKEND=ollama|groq|anthropic.",
             remaining,
         )
         pending_fh = None
@@ -240,6 +230,7 @@ async def score_papers(
     logger.info(
         f"Scoring {remaining} papers in batches of {batch_size}"
         + (f" (resuming from index {start_idx})" if start_idx else "")
+        + f" [{backend} / {info['scorer_model']} / parallel={info['scorer_parallel']}]"
     )
 
     # ── Open cache for appending ─────────────────────────────────────────────
@@ -251,7 +242,7 @@ async def score_papers(
     try:
         for i in range(start_idx, len(records), batch_size):
             batch = records[i : i + batch_size]
-            tasks = [_score_single(paper, config) for paper in batch]
+            tasks = [_score_single(paper, config, sem) for paper in batch]
             scored_batch: list[PaperRecord] = await asyncio.gather(
                 *tasks, return_exceptions=False
             )
@@ -300,7 +291,11 @@ async def score_papers(
     return all_scored
 
 
-async def _score_single(paper: PaperRecord, config: Config) -> PaperRecord:
+async def _score_single(
+    paper: PaperRecord,
+    config: Config,
+    sem: asyncio.Semaphore,
+) -> PaperRecord:
     abstract = paper.abstract or "[No abstract available]"
     prompt = _USER_TEMPLATE.format(
         project_title=config.project_title,
@@ -316,9 +311,11 @@ async def _score_single(paper: PaperRecord, config: Config) -> PaperRecord:
     )
 
     try:
-        raw_json = await _call_claude(prompt)
-        scored = _apply_scoring(paper, raw_json, config)
-    except Exception as e:
+        async with sem:
+            raw_str = await call_scorer(prompt)
+        data = json.loads(raw_str)
+        scored = _apply_scoring(paper, data, config)
+    except (ScoringBackendError, json.JSONDecodeError, Exception) as e:
         logger.error(f"Scoring failed for '{paper.title[:60]}': {e}")
         scored = paper.model_copy(
             update={
@@ -332,33 +329,6 @@ async def _score_single(paper: PaperRecord, config: Config) -> PaperRecord:
         )
 
     return scored
-
-
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2, min=5, max=60),
-    retry=retry_if_exception_type(anthropic.RateLimitError),
-    reraise=True,
-)
-async def _call_claude(prompt: str) -> dict:
-    client = _get_client()
-    resp = await client.messages.create(
-        model=_MODEL,
-        max_tokens=512,
-        system=_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    from anthropic.types import TextBlock
-
-    text_block = next((b for b in resp.content if isinstance(b, TextBlock)), None)
-    if text_block is None:
-        raise ValueError("No TextBlock in Claude response")
-    text = text_block.text.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text)
 
 
 def _apply_scoring(paper: PaperRecord, data: dict, config: Config) -> PaperRecord:

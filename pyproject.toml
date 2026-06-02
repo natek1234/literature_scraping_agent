@@ -11,8 +11,9 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 
 dependencies = [
-    # ── Anthropic SDK ─────────────────────────────────────────────────────────
-    "anthropic>=0.40.0",            # Claude API client (scoring calls)
+    # ── LLM Backends ──────────────────────────────────────────────────────────
+    "openai>=1.54.0",              # Ollama uses the OpenAI-compatible local API
+    "groq>=0.11.0",                # Groq cloud fallback (free tier)
 
     # ── HTTP & async ──────────────────────────────────────────────────────────
     "requests>=2.32.0",             # Sync HTTP for simple API calls
@@ -24,8 +25,10 @@ dependencies = [
     "playwright>=1.48.0",           # Chromium automation for WoS, Scopus, etc.
 
     # ── Academic database clients ─────────────────────────────────────────────
-    "biopython>=1.84",              # Entrez utilities for PubMed (Bio.Entrez)
     "feedparser>=6.0.11",           # arXiv Atom feed parsing
+
+    # ── Data Analysis ─────────────────────────────────────────────────────────
+    "pandas>=2.2.0",               # Groupby operations in the analysis pipeline
 
     # ── Zotero integration ────────────────────────────────────────────────────
     "pyzotero>=1.5.18",             # Zotero Web API client
@@ -70,6 +73,7 @@ dev = [
 
 [project.scripts]
 source-papers = "src.sourcing_agent.main:cli"
+run-analysis = "src.sourcing_agent.analysis.post_process:cli"
 
 # ── Tool configuration ────────────────────────────────────────────────────────
 
