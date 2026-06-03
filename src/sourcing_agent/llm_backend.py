@@ -35,7 +35,7 @@ def _ollama_parallel() -> int:
 
 
 def _scorer_backend() -> str:
-    return os.environ.get("SCORER_BACKEND", "ollama").lower()
+    return os.environ.get("SCORER_BACKEND", "groq").lower()
 
 
 def _check_ollama_sync() -> bool:
@@ -139,9 +139,9 @@ async def _call_anthropic(prompt: str) -> str:
 async def call_scorer(prompt: str) -> str:
     """Call the scoring backend. Returns a raw JSON response string.
 
-    Tier 1 (Ollama): attempt twice; on double JSON parse failure escalate to Tier 2.
-    Tier 2 (Groq): cloud fallback.
-    Tier 3 (Anthropic): used only when SCORER_BACKEND=anthropic.
+    Default (groq): Groq primary, Ollama fallback on failure.
+    Explicit ollama: Ollama primary (2 attempts), Groq fallback.
+    Explicit anthropic: Anthropic only, no fallback.
     Raises ScoringBackendError if all available tiers fail.
     """
     backend = _scorer_backend()
@@ -149,28 +149,66 @@ async def call_scorer(prompt: str) -> str:
     if backend == "anthropic":
         return await _call_anthropic(prompt)
 
-    if backend == "groq":
-        try:
-            return await _call_groq(prompt, system=_SCORER_SYSTEM)
-        except Exception as e:
-            raise ScoringBackendError(f"Groq backend failed: {e}") from e
+    if backend == "ollama":
+        # Explicit Ollama mode: Ollama x2, then Groq fallback
+        if not await _check_ollama_available():
+            groq_key = os.environ.get("GROQ_API_KEY", "")
+            if not groq_key:
+                raise ScoringBackendError(
+                    "Ollama unavailable and GROQ_API_KEY not set — no scoring backend available"
+                )
+            try:
+                return await _call_groq(prompt, system=_SCORER_SYSTEM)
+            except Exception as e:
+                raise ScoringBackendError(f"Groq fallback failed: {e}") from e
 
-    # Default: ollama with groq fallback
-    if not await _check_ollama_available():
+        try:
+            raw = await _call_ollama(prompt)
+            json.loads(raw)
+            return raw
+        except json.JSONDecodeError:
+            logger.debug(
+                "Ollama returned invalid JSON on first attempt — retrying at temperature=0"
+            )
+        except Exception as e:
+            logger.warning(f"Ollama attempt 1 failed: {e}")
+
+        try:
+            raw = await _call_ollama(prompt, temperature=0.0)
+            json.loads(raw)
+            return raw
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Ollama double failure — escalating to Groq: {e}")
+
         groq_key = os.environ.get("GROQ_API_KEY", "")
         if not groq_key:
             raise ScoringBackendError(
-                "Ollama unavailable and GROQ_API_KEY not set — no scoring backend available"
+                "Ollama failed twice and GROQ_API_KEY not set — all backends exhausted"
             )
         try:
             return await _call_groq(prompt, system=_SCORER_SYSTEM)
         except Exception as e:
-            raise ScoringBackendError(f"Groq fallback failed: {e}") from e
+            raise ScoringBackendError(f"All backends failed: {e}") from e
 
-    # Attempt 1: Ollama at default temperature
+    # Default "groq": Groq primary, Ollama fallback
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if groq_key:
+        try:
+            return await _call_groq(prompt, system=_SCORER_SYSTEM)
+        except Exception as e:
+            logger.warning(f"Groq scorer failed — falling back to Ollama: {e}")
+
+    # Ollama fallback (or sole option when GROQ_API_KEY not set)
+    if not await _check_ollama_available():
+        if not groq_key:
+            raise ScoringBackendError(
+                "No scoring backend available — set GROQ_API_KEY or start Ollama (ollama serve)"
+            )
+        raise ScoringBackendError("Groq failed and Ollama is not available")
+
     try:
         raw = await _call_ollama(prompt)
-        json.loads(raw)  # validate JSON
+        json.loads(raw)
         return raw
     except json.JSONDecodeError:
         logger.debug(
@@ -179,23 +217,11 @@ async def call_scorer(prompt: str) -> str:
     except Exception as e:
         logger.warning(f"Ollama attempt 1 failed: {e}")
 
-    # Attempt 2: Ollama at temperature=0
     try:
         raw = await _call_ollama(prompt, temperature=0.0)
-        json.loads(raw)  # validate JSON
+        json.loads(raw)
         return raw
     except (json.JSONDecodeError, Exception) as e:
-        logger.warning(f"Ollama double failure — escalating to Groq: {e}")
-
-    # Tier 2 fallback: Groq
-    groq_key = os.environ.get("GROQ_API_KEY", "")
-    if not groq_key:
-        raise ScoringBackendError(
-            "Ollama failed twice and GROQ_API_KEY not set — all backends exhausted"
-        )
-    try:
-        return await _call_groq(prompt, system=_SCORER_SYSTEM)
-    except Exception as e:
         raise ScoringBackendError(f"All backends failed: {e}") from e
 
 

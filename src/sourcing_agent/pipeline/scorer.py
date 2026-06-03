@@ -172,12 +172,9 @@ async def score_papers(
     # ── Check backend availability ────────────────────────────────────────────
     info = get_backend_info()
     backend = info["scorer_backend"]
-    can_score = (
-        (backend == "anthropic" and info["anthropic_available"])
-        or (backend == "groq" and info["groq_available"])
-        or (
-            backend == "ollama" and (info["ollama_available"] or info["groq_available"])
-        )
+    can_score = (backend == "anthropic" and info["anthropic_available"]) or (
+        backend in ("groq", "ollama")
+        and (info["groq_available"] or info["ollama_available"])
     )
     sem = asyncio.Semaphore(info["scorer_parallel"])
 
