@@ -203,8 +203,8 @@ def _write_section_coverage(
         ]
         for col_idx, val in enumerate(row, start=1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            if coverage == "needs more":
-                cell.fill = _YELLOW if col_idx == 7 else None
+            if coverage == "needs more" and col_idx == 7:
+                cell.fill = _YELLOW
 
     _auto_width(ws, headers)
 

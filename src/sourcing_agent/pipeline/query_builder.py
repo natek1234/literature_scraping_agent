@@ -57,12 +57,14 @@ def build_queries(config: Config) -> dict[str, list[str]]:
             if not cluster_terms:
                 continue
 
-            if name in ("Semantic Scholar", "arXiv"):
-                # S2 and arXiv both work best with natural language cluster terms.
-                # S2 rejects complex boolean; arXiv's category filter (applied in
-                # databases/arxiv.py) already scopes the discipline domain, so tier_1
-                # boolean strings are redundant and produce 0 results when quoted.
-                full_query = " ".join(cluster_terms[:6])
+            if name in ("Semantic Scholar", "arXiv", "NASA Technical Reports Server"):
+                # S2 and arXiv work best with natural language cluster terms.
+                # S2 rejects complex boolean; arXiv's category filter already scopes
+                # the discipline, so boolean strings are redundant.
+                # NTRS uses Elasticsearch in "all-terms-must-match" mode: 5+ words
+                # returns 0 results, so cap at 3 cluster terms.
+                limit = 3 if name == "NASA Technical Reports Server" else 6
+                full_query = " ".join(cluster_terms[:limit])
             else:
                 and_op = _AND.get(name, " AND ")
                 tier1_parts = [_quote(t, name) for t in config.keywords_tier_1]
@@ -123,12 +125,16 @@ def build_supplementary_queries(
     enabled_dbs = [db for db in config.databases if db.enabled]
     for db in enabled_dbs:
         name = db.name
-        and_op = _AND.get(name, " AND ")
-        or_op = _OR.get(name, " OR ")
-        tier1_parts = [_quote(t, name) for t in config.keywords_tier_1]
-        base_query = and_op.join(tier1_parts)
-        cluster_part = f"({or_op.join(_quote(t, name) for t in cluster_terms)})"
-        result[name] = [f"{base_query}{and_op}{cluster_part}"]
+        if name in ("Semantic Scholar", "arXiv", "NASA Technical Reports Server"):
+            limit = 3 if name == "NASA Technical Reports Server" else 6
+            result[name] = [" ".join(cluster_terms[:limit])]
+        else:
+            and_op = _AND.get(name, " AND ")
+            or_op = _OR.get(name, " OR ")
+            tier1_parts = [_quote(t, name) for t in config.keywords_tier_1]
+            base_query = and_op.join(tier1_parts)
+            cluster_part = f"({or_op.join(_quote(t, name) for t in cluster_terms)})"
+            result[name] = [f"{base_query}{and_op}{cluster_part}"]
 
     return result
 

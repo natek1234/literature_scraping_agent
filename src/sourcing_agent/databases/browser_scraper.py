@@ -4,19 +4,42 @@ import asyncio
 import datetime
 import os
 import re
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote_plus
 
 from loguru import logger
 
 from ..config import Config, DatabaseConfig
 from ..models import PaperRecord
 
-# URLs and search paths per database
-_DB_URLS: dict[str, str] = {
-    "IEEE Xplore": "https://ieeexplore.ieee.org/search/searchresult.jsp",
-    "Web of Science": "https://www.webofscience.com/wos/woscc/basic-search",
-    "Scopus": "https://www.scopus.com/search/form.uri",
-    "ACM Digital Library": "https://dl.acm.org/search/",
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Search page paths relative to each database's root (proxy or direct)
+_SEARCH_PATHS: dict[str, str] = {
+    "Web of Science": "/wos/woscc/basic-search",
+    "Scopus": "/search/form.uri?display=basic",
+    "IEEE Xplore": "/search/searchresult.jsp",
+    "ACM Digital Library": "/search/",
 }
+
+# Direct (non-proxy) base URLs — fallback when no proxy is configured
+_DIRECT_BASES: dict[str, str] = {
+    "Web of Science": "https://www.webofscience.com",
+    "Scopus": "https://www.scopus.com",
+    "IEEE Xplore": "https://ieeexplore.ieee.org",
+    "ACM Digital Library": "https://dl.acm.org",
+}
+
+# Saved browser session files (Option B). outputs/ is already in .gitignore.
+_SESSION_DIR = Path("outputs/.auth")
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
 
 
 async def search(
@@ -25,33 +48,28 @@ async def search(
     name = db_config.name
     cred_env = db_config.credential_env_vars
 
-    username_key = cred_env.get("username", "")
-    password_key = cred_env.get("password", "")
-    proxy_key = cred_env.get("proxy_url", "")
-
-    username = os.environ.get(username_key, "")
-    password = os.environ.get(password_key, "")
-    proxy_url = os.environ.get(proxy_key, "") if proxy_key else ""
+    username = os.environ.get(cred_env.get("username", ""), "")
+    password = os.environ.get(cred_env.get("password", ""), "")
+    proxy_url = (
+        os.environ.get(cred_env.get("proxy_url", ""), "")
+        if cred_env.get("proxy_url")
+        else ""
+    )
 
     _PLACEHOLDERS = ("your_email", "your_password", "placeholder", "institution.edu")
-
     if not username or not password:
         logger.warning(
-            f"{name}: credentials missing (env vars: {username_key}, {password_key}) — skipping"
+            f"{name}: credentials missing "
+            f"(env vars: {cred_env.get('username')}, {cred_env.get('password')}) — skipping"
         )
         return []
-
     if any(p in username for p in _PLACEHOLDERS) or any(
         p in password for p in _PLACEHOLDERS
     ):
         logger.warning(f"{name}: placeholder credentials detected — skipping")
         return []
-
-    # Skip placeholder proxy URLs (not configured for real institution)
     if proxy_url and "your-institution" in proxy_url:
-        logger.warning(
-            f"{name}: proxy URL is a placeholder — skipping (update .env with real proxy)"
-        )
+        logger.warning(f"{name}: proxy URL is a placeholder — skipping")
         return []
 
     try:
@@ -60,8 +78,7 @@ async def search(
         logger.error(f"{name}: playwright not installed — skipping")
         return []
 
-    db_url = _DB_URLS.get(name, "")
-    if not db_url:
+    if name not in _SEARCH_PATHS:
         logger.warning(f"{name}: no URL configured — skipping")
         return []
 
@@ -69,62 +86,254 @@ async def search(
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-            )
-            page = await context.new_page()
             try:
-                if proxy_url:
-                    await page.goto(proxy_url, timeout=30000)
-                    await asyncio.sleep(3)
-                    await _try_login(page, username, password, name)
-
-                records = await _scrape_db(page, name, db_url, query, db_config, config)
-
-            except Exception as e:
-                logger.error(f"{name}: scraping error — {e}")
+                context, search_base = await _get_authenticated_context(
+                    browser, db_config, username, password, proxy_url
+                )
+                page = await context.new_page()
+                try:
+                    records = await _scrape_db(
+                        page, name, search_base, query, db_config, config
+                    )
+                    # Refresh saved session after successful scraping (servers
+                    # often update cookie expiry on use, so re-saving keeps the
+                    # Option B session alive longer).
+                    await _save_session(context, name)
+                except Exception as exc:
+                    logger.error(f"{name}: scraping error — {exc}")
+                finally:
+                    await page.close()
+                    await context.close()
             finally:
                 await browser.close()
-
-    except Exception as e:
-        logger.error(f"{name}: playwright launch failed — {e}")
+    except Exception as exc:
+        logger.error(f"{name}: playwright launch failed — {exc}")
 
     logger.info(f"{name}: '{query[:60]}' → {len(records)} records")
     return records
 
 
-async def _try_login(page: object, username: str, password: str, db_name: str) -> None:
-    """Attempt SSO login — handles common form patterns."""
+# ── Authentication: Option B → Option A ──────────────────────────────────────
+
+
+async def _get_authenticated_context(
+    browser: Any,
+    db_config: DatabaseConfig,
+    username: str,
+    password: str,
+    proxy_url: str,
+) -> tuple[Any, str]:
+    """
+    Return ``(BrowserContext, search_base_url)``.
+
+    ``search_base_url`` is the URL root from which each scraper appends its
+    database-specific search path (e.g. ``/wos/woscc/basic-search``).
+
+    Authentication strategy — in order:
+
+    Option B (fast path)
+        Load a saved ``outputs/.auth/<db>_session.json`` file.  Navigate to
+        the search page and confirm we are *not* on a login form.  If the
+        session is still valid, return immediately — no SSO automation needed.
+
+    Option A (SSO automation)
+        Open a fresh browser context, navigate to the institutional proxy URL,
+        and fill the login form (UofA Shibboleth selectors first, then generic
+        fallbacks).  After login, navigate to the search page to verify
+        authentication succeeded and persist the new session so the next call
+        takes the Option B fast path.
+    """
+    from playwright.async_api import Browser
+
+    assert isinstance(browser, Browser)
+
+    name = db_config.name
+    search_path = _SEARCH_PATHS[name]
+    base = proxy_url.rstrip("/") if proxy_url else _DIRECT_BASES.get(name, "")
+    search_url = f"{base}{search_path}"
+    session_file = _session_path(name)
+
+    # ── Option B: try saved session ───────────────────────────────────────────
+    if session_file.exists():
+        logger.debug(f"{name}: trying saved session — {session_file} (Option B)")
+        try:
+            ctx = await browser.new_context(
+                storage_state=str(session_file),
+                user_agent=_USER_AGENT,
+            )
+            probe = await ctx.new_page()
+            try:
+                await probe.goto(search_url, timeout=30000)
+                await probe.wait_for_load_state("networkidle", timeout=20000)
+                on_login = await _is_on_login_page(probe)
+            finally:
+                await probe.close()
+
+            if not on_login:
+                logger.info(f"{name}: saved session is valid — using Option B")
+                return ctx, base
+
+            logger.info(
+                f"{name}: saved session has expired — falling back to SSO (Option A)"
+            )
+            await ctx.close()
+
+        except Exception as exc:
+            logger.warning(
+                f"{name}: Option B failed ({exc}) — falling back to SSO (Option A)"
+            )
+
+    # ── Option A: SSO login via proxy ─────────────────────────────────────────
+    logger.info(f"{name}: starting SSO login (Option A)")
+    ctx = await browser.new_context(user_agent=_USER_AGENT)
+
+    if proxy_url:
+        sso_page = await ctx.new_page()
+        try:
+            await sso_page.goto(proxy_url, timeout=30000)
+            await asyncio.sleep(3)
+            await _try_sso_login(sso_page, username, password, name)
+        except Exception as exc:
+            logger.warning(f"{name}: SSO navigation error — {exc}")
+        finally:
+            await sso_page.close()
+
+        # Verify login succeeded and persist session for next run
+        verify = await ctx.new_page()
+        try:
+            await verify.goto(search_url, timeout=30000)
+            await verify.wait_for_load_state("networkidle", timeout=20000)
+            if not await _is_on_login_page(verify):
+                logger.info(
+                    f"{name}: SSO login confirmed — saving session for Option B"
+                )
+                await _save_session(ctx, name)
+            else:
+                logger.warning(
+                    f"{name}: still on login page after SSO attempt — "
+                    "check credentials or MFA requirement"
+                )
+        except Exception as exc:
+            logger.warning(f"{name}: post-login verification failed — {exc}")
+        finally:
+            await verify.close()
+
+    return ctx, base
+
+
+async def _is_on_login_page(page: Any) -> bool:
+    """Return True if the current page is an SSO/login form (session absent or expired)."""
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
+
+    login_selectors = [
+        "#j_username",  # UofA Shibboleth / standard SAML
+        'input[name="j_username"]',
+        "#netid",
+        'input[name="netid"]',
+        "#username",
+        'input[name="username"]',
+        'input[type="email"][autocomplete="username"]',
+    ]
+    for sel in login_selectors:
+        if await page.query_selector(sel):
+            return True
+    return False
+
+
+async def _try_sso_login(
+    page: Any, username: str, password: str, db_name: str
+) -> None:
+    """
+    Fill and submit an institutional SSO form.
+
+    Selector priority: UofA Shibboleth (``j_username`` / ``j_password``) first,
+    then generic fallbacks.  Detects Duo MFA and logs a clear warning rather
+    than raising, so the pipeline can continue with other databases.
+    """
+    from playwright.async_api import Page
+
+    assert isinstance(page, Page)
+
     try:
         await page.wait_for_load_state("networkidle", timeout=15000)
-        for sel in ("#username", 'input[name="username"]', 'input[type="email"]'):
+
+        for sel in (
+            "#j_username",
+            'input[name="j_username"]',
+            "#netid",
+            'input[name="netid"]',
+            "#username",
+            'input[name="username"]',
+            'input[type="email"]',
+        ):
             if await page.query_selector(sel):
                 await page.fill(sel, username)
                 break
-        for sel in ("#password", 'input[name="password"]', 'input[type="password"]'):
+
+        for sel in (
+            "#j_password",
+            'input[name="j_password"]',
+            "#password",
+            'input[name="password"]',
+            'input[type="password"]',
+        ):
             if await page.query_selector(sel):
                 await page.fill(sel, password)
                 break
+
         for sel in ('button[type="submit"]', 'input[type="submit"]', "#submit"):
             if await page.query_selector(sel):
                 await page.click(sel)
                 break
+
         await page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception as e:
-        logger.warning(f"{db_name}: login attempt failed — {e}")
+
+        # Detect Duo MFA — cannot be automated; steer user to Option B
+        if await page.query_selector(
+            "#duo_iframe, iframe[data-dashtype='prompt'], .duo-frame"
+        ):
+            logger.warning(
+                f"{db_name}: Duo MFA prompt detected — automated SSO cannot "
+                "proceed past MFA. Log in manually once in a headed browser, "
+                "then run: python outputs/save_browser_session.py"
+            )
+
+    except Exception as exc:
+        logger.warning(f"{db_name}: SSO login attempt failed — {exc}")
+
+
+# ── Session persistence helpers ───────────────────────────────────────────────
+
+
+def _session_path(db_name: str) -> Path:
+    slug = db_name.lower().replace(" ", "_")
+    return _SESSION_DIR / f"{slug}_session.json"
+
+
+async def _save_session(context: Any, db_name: str) -> None:
+    """Persist browser cookies and storage state to disk (enables Option B on next run)."""
+    from playwright.async_api import BrowserContext
+
+    assert isinstance(context, BrowserContext)
+
+    _SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    path = _session_path(db_name)
+    try:
+        await context.storage_state(path=str(path))
+        logger.debug(f"{db_name}: session saved → {path}")
+    except Exception as exc:
+        logger.warning(f"{db_name}: could not save session — {exc}")
+
+
+# ── Dispatcher ────────────────────────────────────────────────────────────────
 
 
 async def _scrape_db(
-    page: object,
+    page: Any,
     name: str,
-    db_url: str,
+    search_base: str,
     query: str,
     db_config: DatabaseConfig,
     config: Config,
@@ -134,46 +343,53 @@ async def _scrape_db(
     assert isinstance(page, Page)
 
     if name == "Web of Science":
-        return await _scrape_wos(page, query, db_config)
+        return await _scrape_wos(page, query, db_config, search_base)
     elif name == "Scopus":
-        return await _scrape_scopus(page, query, db_config)
+        return await _scrape_scopus(page, query, db_config, search_base)
     elif name == "IEEE Xplore":
-        return await _scrape_ieee(page, query, db_config)
+        return await _scrape_ieee(page, query, db_config, search_base)
     elif name == "ACM Digital Library":
         return await _scrape_acm(page, query, db_config)
     return []
 
 
+# ── Per-database scrapers ─────────────────────────────────────────────────────
+
+
 async def _scrape_wos(
-    page: object, query: str, db_config: DatabaseConfig
+    page: Any,
+    query: str,
+    db_config: DatabaseConfig,
+    search_base: str = "https://www.webofscience.com",
 ) -> list[PaperRecord]:
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
+
     records: list[PaperRecord] = []
     max_results = db_config.max_results_per_query
+    search_url = f"{search_base.rstrip('/')}/wos/woscc/basic-search"
 
     try:
-        await page.goto(
-            "https://www.webofscience.com/wos/woscc/basic-search", timeout=30000
-        )
+        await page.goto(search_url, timeout=30000)
         await page.wait_for_load_state("networkidle", timeout=20000)
         await asyncio.sleep(3)
 
         search_input = None
         for sel in (
             'input[name="search-main-box"]',
-            'input[placeholder*="search"]',
+            'input[placeholder*="search" i]',
             'textarea[name="value"]',
             "#search-option",
         ):
-            el = await page.query_selector(sel)
-            if el:
+            if await page.query_selector(sel):
                 search_input = sel
                 break
 
         if not search_input:
-            logger.warning("Web of Science: could not find search box")
+            logger.warning(
+                "Web of Science: search box not found — authentication may have failed"
+            )
             return []
 
         await page.fill(search_input, query)
@@ -194,42 +410,42 @@ async def _scrape_wos(
 
         records = await _extract_wos_results(page, max_results)
 
-    except Exception as e:
-        logger.error(f"WoS scraping error: {e}")
+    except Exception as exc:
+        logger.error(f"WoS scraping error: {exc}")
 
     return records
 
 
-async def _extract_wos_results(page: object, max_results: int) -> list[PaperRecord]:
+async def _extract_wos_results(page: Any, max_results: int) -> list[PaperRecord]:
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
-    records: list[PaperRecord] = []
 
+    records: list[PaperRecord] = []
     try:
         result_items = await page.query_selector_all("app-record, .search-results-item")
         for item in result_items[:max_results]:
             try:
                 title_el = await item.query_selector(".title, h3 a, .record-title")
-                title = await title_el.inner_text() if title_el else ""
-                title = title.strip()
+                title = (await title_el.inner_text()).strip() if title_el else ""
                 if not title:
                     continue
 
                 authors_els = await item.query_selector_all(
                     ".authors .value, .author-name"
                 )
-                authors = [await el.inner_text() for el in authors_els]
-                authors = [a.strip() for a in authors if a.strip()]
+                authors = [
+                    (await el.inner_text()).strip()
+                    for el in authors_els
+                    if (await el.inner_text()).strip()
+                ]
 
                 year_el = await item.query_selector(".pub-year, .year")
-                year_text = await year_el.inner_text() if year_el else ""
+                year_text = (await year_el.inner_text()) if year_el else ""
                 year = _extract_year(year_text)
 
                 venue_el = await item.query_selector(".source-title, .venue")
-                venue = await venue_el.inner_text() if venue_el else None
-                if venue:
-                    venue = venue.strip()
+                venue = (await venue_el.inner_text()).strip() if venue_el else None
 
                 records.append(
                     PaperRecord(
@@ -243,25 +459,28 @@ async def _extract_wos_results(page: object, max_results: int) -> list[PaperReco
                 )
             except Exception:
                 continue
-    except Exception as e:
-        logger.warning(f"WoS result extraction error: {e}")
+    except Exception as exc:
+        logger.warning(f"WoS result extraction error: {exc}")
 
     return records
 
 
 async def _scrape_scopus(
-    page: object, query: str, db_config: DatabaseConfig
+    page: Any,
+    query: str,
+    db_config: DatabaseConfig,
+    search_base: str = "https://www.scopus.com",
 ) -> list[PaperRecord]:
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
+
     records: list[PaperRecord] = []
     max_results = db_config.max_results_per_query
+    search_url = f"{search_base.rstrip('/')}/search/form.uri?display=basic"
 
     try:
-        await page.goto(
-            "https://www.scopus.com/search/form.uri?display=basic", timeout=30000
-        )
+        await page.goto(search_url, timeout=30000)
         await page.wait_for_load_state("networkidle", timeout=20000)
         await asyncio.sleep(3)
 
@@ -295,13 +514,12 @@ async def _scrape_scopus(
         for item in result_items[:max_results]:
             try:
                 title_el = await item.query_selector("h3 a, .documentTitle a")
-                title = await title_el.inner_text() if title_el else ""
-                title = title.strip()
+                title = (await title_el.inner_text()).strip() if title_el else ""
                 if not title:
                     continue
 
                 authors_el = await item.query_selector(".authorNames, .authors")
-                authors_text = await authors_el.inner_text() if authors_el else ""
+                authors_text = (await authors_el.inner_text()) if authors_el else ""
                 authors = [a.strip() for a in authors_text.split(",") if a.strip()]
 
                 year_text = ""
@@ -313,9 +531,7 @@ async def _scrape_scopus(
                 year = _extract_year(year_text)
 
                 venue_el = await item.query_selector(".sourceTitle, .publicationName")
-                venue = await venue_el.inner_text() if venue_el else None
-                if venue:
-                    venue = venue.strip()
+                venue = (await venue_el.inner_text()).strip() if venue_el else None
 
                 records.append(
                     PaperRecord(
@@ -330,25 +546,30 @@ async def _scrape_scopus(
             except Exception:
                 continue
 
-    except Exception as e:
-        logger.error(f"Scopus scraping error: {e}")
+    except Exception as exc:
+        logger.error(f"Scopus scraping error: {exc}")
 
     return records
 
 
 async def _scrape_ieee(
-    page: object, query: str, db_config: DatabaseConfig
+    page: Any,
+    query: str,
+    db_config: DatabaseConfig,
+    search_base: str = "https://ieeexplore.ieee.org",
 ) -> list[PaperRecord]:
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
+
     records: list[PaperRecord] = []
     max_results = db_config.max_results_per_query
+    search_url = (
+        f"{search_base.rstrip('/')}/search/searchresult.jsp"
+        f"?queryText={quote_plus(query)}"
+    )
 
     try:
-        search_url = (
-            f"https://ieeexplore.ieee.org/search/searchresult.jsp?queryText={query}"
-        )
         await page.goto(search_url, timeout=30000)
         await page.wait_for_load_state("networkidle", timeout=20000)
         await asyncio.sleep(3)
@@ -359,13 +580,12 @@ async def _scrape_ieee(
         for item in result_items[:max_results]:
             try:
                 title_el = await item.query_selector("h2 a, .result-item-title a")
-                title = await title_el.inner_text() if title_el else ""
-                title = title.strip()
+                title = (await title_el.inner_text()).strip() if title_el else ""
                 if not title:
                     continue
 
                 authors_el = await item.query_selector(".authors-info, .author")
-                authors_text = await authors_el.inner_text() if authors_el else ""
+                authors_text = (await authors_el.inner_text()) if authors_el else ""
                 authors = [
                     a.strip() for a in re.split(r"[;,]", authors_text) if a.strip()
                 ]
@@ -379,9 +599,7 @@ async def _scrape_ieee(
                 year = _extract_year(year_text)
 
                 venue_el = await item.query_selector(".publication-title")
-                venue = await venue_el.inner_text() if venue_el else None
-                if venue:
-                    venue = venue.strip()
+                venue = (await venue_el.inner_text()).strip() if venue_el else None
 
                 doi_el = await item.query_selector('a[href*="doi"]')
                 doi = None
@@ -404,18 +622,22 @@ async def _scrape_ieee(
             except Exception:
                 continue
 
-    except Exception as e:
-        logger.error(f"IEEE Xplore scraping error: {e}")
+    except Exception as exc:
+        logger.error(f"IEEE Xplore scraping error: {exc}")
 
     return records
 
 
 async def _scrape_acm(
-    page: object, query: str, db_config: DatabaseConfig
+    page: Any,
+    query: str,
+    db_config: DatabaseConfig,
 ) -> list[PaperRecord]:
+    """ACM Digital Library is open access — no proxy or session needed."""
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
+
     records: list[PaperRecord] = []
     max_results = db_config.max_results_per_query
 
@@ -424,7 +646,11 @@ async def _scrape_acm(
         await page.wait_for_load_state("networkidle", timeout=20000)
         await asyncio.sleep(3)
 
-        for sel in ("#search-input", 'input[name="AllField"]', 'input[type="search"]'):
+        for sel in (
+            "#search-input",
+            'input[name="AllField"]',
+            'input[type="search"]',
+        ):
             el = await page.query_selector(sel)
             if el:
                 await page.fill(sel, query)
@@ -443,14 +669,16 @@ async def _scrape_acm(
         for item in result_items[:max_results]:
             try:
                 title_el = await item.query_selector("h5.issue-item__title a")
-                title = await title_el.inner_text() if title_el else ""
-                title = title.strip()
+                title = (await title_el.inner_text()).strip() if title_el else ""
                 if not title:
                     continue
 
                 authors_els = await item.query_selector_all(".hlFld-ContribAuthor")
-                authors = [await el.inner_text() for el in authors_els]
-                authors = [a.strip() for a in authors if a.strip()]
+                authors = [
+                    (await el.inner_text()).strip()
+                    for el in authors_els
+                    if (await el.inner_text()).strip()
+                ]
 
                 year_text = ""
                 date_el = await item.query_selector(".bookPubDate, .issue-item__detail")
@@ -459,7 +687,7 @@ async def _scrape_acm(
                 year = _extract_year(year_text)
 
                 venue_el = await item.query_selector(".issue-item__detail em")
-                venue = await venue_el.inner_text() if venue_el else None
+                venue = (await venue_el.inner_text()).strip() if venue_el else None
 
                 doi_el = await item.query_selector('a[href*="/doi/"]')
                 doi = None
@@ -473,7 +701,7 @@ async def _scrape_acm(
                         title=title,
                         authors=authors,
                         year=year,
-                        venue=str(venue).strip() if venue else None,
+                        venue=str(venue) if venue else None,
                         doi=doi,
                         source_database="ACM Digital Library",
                         retrieved_at=datetime.datetime.utcnow().isoformat(),
@@ -482,10 +710,13 @@ async def _scrape_acm(
             except Exception:
                 continue
 
-    except Exception as e:
-        logger.error(f"ACM DL scraping error: {e}")
+    except Exception as exc:
+        logger.error(f"ACM DL scraping error: {exc}")
 
     return records
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
 
 def _extract_year(text: str) -> int | None:
