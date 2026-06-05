@@ -85,7 +85,13 @@ def write_to_zotero(
 def _clear_collection_items(
     z: zotero.Zotero, top_key: str, subcol_keys: dict[str, str]
 ) -> None:
-    """Delete all library items that belong to this collection tree."""
+    """Delete all library items that belong to this collection tree.
+
+    Fetches a fresh library version immediately before each batch DELETE to
+    avoid HTTP 412 (Precondition Failed) errors caused by the collection
+    ensure calls or Zotero desktop syncing bumping the library version between
+    our item-fetch and delete calls.
+    """
     seen: set[str] = set()
     all_items: list[dict] = []
 
@@ -108,16 +114,31 @@ def _clear_collection_items(
 
     logger.info(f"Zotero: deleting {len(all_items)} existing items...")
     _BATCH = 50
+    _MAX_RETRIES = 3
     deleted = 0
     for i in range(0, len(all_items), _BATCH):
         batch = all_items[i : i + _BATCH]
-        try:
-            z.delete_item(batch)
-            deleted += len(batch)
-        except Exception as exc:
-            logger.warning(f"Zotero: batch delete failed ({exc}); continuing")
-        time.sleep(0.5)  # gentle rate limiting
-    logger.info(f"Zotero: {deleted} items cleared")
+        for attempt in range(_MAX_RETRIES):
+            try:
+                # Fetch a fresh library version immediately before the DELETE
+                # so the If-Unmodified-Since-Version header is current.
+                last_modified = z.last_modified_version()
+                z.delete_item(batch, last_modified=last_modified)
+                deleted += len(batch)
+                break
+            except Exception as exc:
+                err = str(exc)
+                is_412 = "412" in err or "precondition" in err.lower()
+                if is_412 and attempt < _MAX_RETRIES - 1:
+                    logger.debug(f"Zotero: 412 on batch {i // _BATCH + 1}, retrying...")
+                    time.sleep(1)
+                else:
+                    logger.warning(
+                        f"Zotero: batch {i // _BATCH + 1} delete failed ({exc}); skipping"
+                    )
+                    break
+        time.sleep(0.3)
+    logger.info(f"Zotero: {deleted}/{len(all_items)} items cleared")
 
 
 def _build_doi_title_index(z: zotero.Zotero, top_key: str) -> tuple[set[str], set[str]]:
