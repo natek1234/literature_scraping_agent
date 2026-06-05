@@ -65,6 +65,12 @@ def build_queries(config: Config) -> dict[str, list[str]]:
                 # returns 0 results, so cap at 3 cluster terms.
                 limit = 3 if name == "NASA Technical Reports Server" else 6
                 full_query = " ".join(cluster_terms[:limit])
+            elif name == "Web of Science":
+                full_query = _build_wos_query(config.keywords_tier_1, cluster_terms)
+            elif name == "Scopus":
+                full_query = _build_scopus_query(config.keywords_tier_1, cluster_terms)
+            elif name in ("IEEE Xplore", "ACM Digital Library"):
+                full_query = _build_ieee_query(config.keywords_tier_1, cluster_terms)
             else:
                 and_op = _AND.get(name, " AND ")
                 tier1_parts = [_quote(t, name) for t in config.keywords_tier_1]
@@ -128,6 +134,12 @@ def build_supplementary_queries(
         if name in ("Semantic Scholar", "arXiv", "NASA Technical Reports Server"):
             limit = 3 if name == "NASA Technical Reports Server" else 6
             result[name] = [" ".join(cluster_terms[:limit])]
+        elif name == "Web of Science":
+            result[name] = [_build_wos_query(config.keywords_tier_1, cluster_terms)]
+        elif name == "Scopus":
+            result[name] = [_build_scopus_query(config.keywords_tier_1, cluster_terms)]
+        elif name in ("IEEE Xplore", "ACM Digital Library"):
+            result[name] = [_build_ieee_query(config.keywords_tier_1, cluster_terms)]
         else:
             and_op = _AND.get(name, " AND ")
             or_op = _OR.get(name, " OR ")
@@ -154,6 +166,46 @@ def _quote(term: str, db_name: str) -> str:
     if " " in term and db_name not in ("Semantic Scholar",):
         return f'"{term}"'
     return term
+
+
+def _shorten_term(term: str, max_words: int = 3) -> str:
+    """Trim long cluster phrases to max_words for boolean search.
+
+    Long exact phrases (5-7 words) return near-zero results on WoS/Scopus/IEEE
+    because the full phrase rarely appears verbatim in abstracts. Keeping ≤3
+    words gives a short, quotable phrase with acceptable precision.
+    """
+    words = term.split()
+    if len(words) <= max_words:
+        return term
+    return " ".join(words[:max_words])
+
+
+def _format_term(term: str) -> str:
+    """Quote multi-word short phrases; leave single words bare."""
+    short = _shorten_term(term)
+    return f'"{short}"' if " " in short else short
+
+
+def _build_wos_query(tier1_terms: list[str], cluster_terms: list[str]) -> str:
+    """WoS advanced search: TS= field tags, shortened cluster phrases."""
+    t1 = " OR ".join(_format_term(t) for t in tier1_terms)
+    cl = " OR ".join(_format_term(t) for t in cluster_terms)
+    return f"TS=({t1}) AND TS=({cl})"
+
+
+def _build_scopus_query(tier1_terms: list[str], cluster_terms: list[str]) -> str:
+    """Scopus advanced search: TITLE-ABS-KEY() field tags, shortened phrases."""
+    t1 = " OR ".join(_format_term(t) for t in tier1_terms)
+    cl = " OR ".join(_format_term(t) for t in cluster_terms)
+    return f"TITLE-ABS-KEY({t1}) AND TITLE-ABS-KEY({cl})"
+
+
+def _build_ieee_query(tier1_terms: list[str], cluster_terms: list[str]) -> str:
+    """IEEE/ACM basic search: boolean OR groups, shortened phrases, no 5-7 word exact strings."""
+    t1 = " OR ".join(_format_term(t) for t in tier1_terms)
+    cl = " OR ".join(_format_term(t) for t in cluster_terms)
+    return f"({t1}) AND ({cl})"
 
 
 def _write_query_log(config: Config, lines: list[str]) -> None:

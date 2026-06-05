@@ -196,14 +196,12 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                     logger.error(f"{db.name}: query failed — {e}")
 
         elif db.type == "paywalled_browser":
-            from .databases.browser_scraper import search as browser_search
+            from .databases.browser_scraper import search_batch as browser_search_batch
 
-            for q in db_queries:
-                try:
-                    batch = await browser_search(db, q, config)
-                    db_records.extend(batch)
-                except Exception as e:
-                    logger.error(f"{db.name}: browser query failed — {e}")
+            try:
+                db_records = await browser_search_batch(db, db_queries, config)
+            except Exception as e:
+                logger.error(f"{db.name}: browser batch failed — {e}")
 
         # Persist to cache so this DB never needs re-querying on resume
         _save_jsonl(db_cache, db_records)

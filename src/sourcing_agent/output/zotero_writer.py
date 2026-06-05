@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import time
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -11,8 +13,17 @@ if TYPE_CHECKING:
     from ..models import PaperRecord
 
 
-def write_to_zotero(records: list[PaperRecord], config: Config) -> int:
-    """Write include/maybe papers to Zotero. Returns count of items written."""
+def write_to_zotero(
+    records: list[PaperRecord], config: Config, clear_first: bool = False
+) -> int:
+    """Write include/maybe papers to Zotero. Returns count of items written.
+
+    Args:
+        clear_first: If True, delete all existing items in the collection
+            before writing — use this to fix duplicates from prior runs.
+            If False (default), existing items with matching DOI or title
+            are skipped (upsert behaviour).
+    """
     z = _get_client()
     if z is None:
         logger.error("Zotero: client unavailable — skipping Zotero write")
@@ -29,16 +40,108 @@ def write_to_zotero(records: list[PaperRecord], config: Config) -> int:
     for name in config.output.zotero.subcollections:
         subcol_keys[name] = _ensure_subcollection(z, top_key, name)
 
+    if clear_first:
+        logger.info("Zotero: clearing all existing items before rewrite...")
+        _clear_collection_items(z, top_key, subcol_keys)
+        existing_dois: set[str] = set()
+        existing_titles: set[str] = set()
+    else:
+        existing_dois, existing_titles = _build_doi_title_index(z, top_key)
+        if existing_dois or existing_titles:
+            logger.info(
+                f"Zotero: upsert mode — {len(existing_dois)} existing DOIs, "
+                f"{len(existing_titles)} title fingerprints loaded"
+            )
+
     written = 0
+    skipped = 0
     for record in to_write:
         try:
+            doi_key = (record.doi or "").strip().lower()
+            title_key = _normalize_title(record.title)
+
+            if doi_key and doi_key in existing_dois:
+                skipped += 1
+                continue
+            if not doi_key and title_key in existing_titles:
+                skipped += 1
+                continue
+
             _write_record(z, record, config, top_key, subcol_keys)
+
+            if doi_key:
+                existing_dois.add(doi_key)
+            existing_titles.add(title_key)
             written += 1
         except Exception as e:
             logger.warning(f"Zotero: failed to write '{record.title[:60]}': {e}")
 
+    if skipped:
+        logger.info(f"Zotero: {skipped} already-existing papers skipped (upsert)")
     logger.info(f"Zotero: {written}/{len(to_write)} papers written")
     return written
+
+
+def _clear_collection_items(
+    z: zotero.Zotero, top_key: str, subcol_keys: dict[str, str]
+) -> None:
+    """Delete all library items that belong to this collection tree."""
+    seen: set[str] = set()
+    all_items: list[dict] = []
+
+    for col_key in [top_key] + [k for k in subcol_keys.values() if k]:
+        try:
+            items = z.everything(z.collection_items_top(col_key))
+            for item in items:
+                key = item.get("key", "")
+                if key and key not in seen:
+                    seen.add(key)
+                    all_items.append(item)
+        except Exception as exc:
+            logger.warning(
+                f"Zotero: could not fetch items from collection {col_key}: {exc}"
+            )
+
+    if not all_items:
+        logger.info("Zotero: no existing items to clear")
+        return
+
+    logger.info(f"Zotero: deleting {len(all_items)} existing items...")
+    _BATCH = 50
+    deleted = 0
+    for i in range(0, len(all_items), _BATCH):
+        batch = all_items[i : i + _BATCH]
+        try:
+            z.delete_item(batch)
+            deleted += len(batch)
+        except Exception as exc:
+            logger.warning(f"Zotero: batch delete failed ({exc}); continuing")
+        time.sleep(0.5)  # gentle rate limiting
+    logger.info(f"Zotero: {deleted} items cleared")
+
+
+def _build_doi_title_index(z: zotero.Zotero, top_key: str) -> tuple[set[str], set[str]]:
+    """Return (doi_set, title_set) of items already in the top collection."""
+    dois: set[str] = set()
+    titles: set[str] = set()
+    try:
+        items = z.everything(z.collection_items_top(top_key))
+        for item in items:
+            data = item.get("data", {})
+            doi = data.get("DOI", "").strip().lower()
+            if doi:
+                dois.add(doi)
+            title = data.get("title", "")
+            if title:
+                titles.add(_normalize_title(title))
+    except Exception as exc:
+        logger.warning(f"Zotero: could not build dedup index — {exc}")
+    return dois, titles
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase + collapse non-alphanumeric chars for fuzzy title dedup."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]", " ", title.lower())).strip()
 
 
 def _get_client() -> zotero.Zotero | None:

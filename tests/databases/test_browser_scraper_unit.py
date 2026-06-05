@@ -345,7 +345,7 @@ class TestScraperUrlConstruction:
 
         goto_url = page.goto.call_args.args[0]
         assert (
-            goto_url == f"{_WOS_PROXY}/wos/woscc/basic-search"
+            goto_url == f"{_WOS_PROXY}/wos/woscc/advanced-search"
         ), f"WoS must navigate via proxy base. Got: {goto_url!r}"
 
     @pytest.mark.asyncio
@@ -372,7 +372,7 @@ class TestScraperUrlConstruction:
 
         goto_url = page.goto.call_args.args[0]
         assert (
-            goto_url == "https://www.webofscience.com/wos/woscc/basic-search"
+            goto_url == "https://www.webofscience.com/wos/woscc/advanced-search"
         ), f"Default (no-proxy) WoS URL should be the direct vendor URL. Got: {goto_url!r}"
 
     # ── Scopus ────────────────────────────────────────────────────────────────
@@ -386,7 +386,7 @@ class TestScraperUrlConstruction:
 
         goto_url = page.goto.call_args.args[0]
         assert (
-            goto_url == f"{_SCOPUS_PROXY}/search/form.uri?display=basic"
+            goto_url == f"{_SCOPUS_PROXY}/search/form.uri?display=advanced"
         ), f"Scopus must navigate via proxy base. Got: {goto_url!r}"
 
     @pytest.mark.asyncio

@@ -19,10 +19,12 @@ _USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Search page paths relative to each database's root (proxy or direct)
+# Search page paths relative to each database's root (proxy or direct).
+# WoS and Scopus use advanced search pages that accept field-tagged query syntax
+# (TS= for WoS, TITLE-ABS-KEY() for Scopus) — basic search pages do not.
 _SEARCH_PATHS: dict[str, str] = {
-    "Web of Science": "/wos/woscc/basic-search",
-    "Scopus": "/search/form.uri?display=basic",
+    "Web of Science": "/wos/woscc/advanced-search",
+    "Scopus": "/search/form.uri?display=advanced",
     "IEEE Xplore": "/search/searchresult.jsp",
     "ACM Digital Library": "/search/",
 }
@@ -111,6 +113,95 @@ async def search(
 
     logger.info(f"{name}: '{query[:60]}' → {len(records)} records")
     return records
+
+
+async def search_batch(
+    db_config: DatabaseConfig, queries: list[str], config: Config
+) -> list[PaperRecord]:
+    """Execute all queries for one database inside a single browser session.
+
+    A single browser launch means the EZProxy session cookie is reused for
+    every query, preventing the ~15-minute wall-clock expiry that occurs when
+    each query spawns its own browser process.  The session file is refreshed
+    after every successful query so it stays alive as long as possible.
+    """
+    name = db_config.name
+    cred_env = db_config.credential_env_vars
+
+    username = os.environ.get(cred_env.get("username", ""), "")
+    password = os.environ.get(cred_env.get("password", ""), "")
+    proxy_url = (
+        os.environ.get(cred_env.get("proxy_url", ""), "")
+        if cred_env.get("proxy_url")
+        else ""
+    )
+
+    _PLACEHOLDERS = ("your_email", "your_password", "placeholder", "institution.edu")
+    if not username or not password:
+        logger.warning(
+            f"{name}: credentials missing "
+            f"(env vars: {cred_env.get('username')}, {cred_env.get('password')}) — skipping"
+        )
+        return []
+    if any(p in username for p in _PLACEHOLDERS) or any(
+        p in password for p in _PLACEHOLDERS
+    ):
+        logger.warning(f"{name}: placeholder credentials detected — skipping")
+        return []
+    if proxy_url and "your-institution" in proxy_url:
+        logger.warning(f"{name}: proxy URL is a placeholder — skipping")
+        return []
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.error(f"{name}: playwright not installed — skipping")
+        return []
+
+    if name not in _SEARCH_PATHS:
+        logger.warning(f"{name}: no URL configured — skipping")
+        return []
+
+    all_records: list[PaperRecord] = []
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                context, search_base = await _get_authenticated_context(
+                    browser, db_config, username, password, proxy_url
+                )
+                for idx, query in enumerate(queries):
+                    page = await context.new_page()
+                    try:
+                        records = await _scrape_db(
+                            page, name, search_base, query, db_config, config
+                        )
+                        all_records.extend(records)
+                        logger.info(
+                            f"{name}: query {idx + 1}/{len(queries)} "
+                            f"→ {len(records)} records"
+                        )
+                        # Refresh saved session so cookie expiry resets on each use
+                        await _save_session(context, name)
+                    except Exception as exc:
+                        logger.error(
+                            f"{name}: query {idx + 1}/{len(queries)} failed — {exc}"
+                        )
+                    finally:
+                        await page.close()
+
+                    if idx < len(queries) - 1:
+                        await asyncio.sleep(3)
+            finally:
+                await browser.close()
+    except Exception as exc:
+        logger.error(f"{name}: playwright launch failed — {exc}")
+
+    logger.info(
+        f"{name}: batch complete — {len(all_records)} total records "
+        f"from {len(queries)} queries"
+    )
+    return all_records
 
 
 # ── Authentication: Option B → Option A ──────────────────────────────────────
@@ -222,7 +313,11 @@ async def _get_authenticated_context(
 
 
 async def _is_on_login_page(page: Any) -> bool:
-    """Return True if the current page is an SSO/login form (session absent or expired)."""
+    """Return True if the current page is an SSO/login form OR a Duo MFA prompt.
+
+    Duo MFA selectors are included so that a session captured mid-MFA challenge
+    is never written to disk — preserving the original valid session file.
+    """
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
@@ -235,6 +330,12 @@ async def _is_on_login_page(page: Any) -> bool:
         "#username",
         'input[name="username"]',
         'input[type="email"][autocomplete="username"]',
+        # Duo MFA — cannot be automated; treat as auth-not-complete
+        "#duo_iframe",
+        'iframe[data-dashtype="prompt"]',
+        ".duo-frame",
+        'iframe[title*="Duo" i]',
+        "#duo-submit-btn",
     ]
     for sel in login_selectors:
         if await page.query_selector(sel):
@@ -242,9 +343,7 @@ async def _is_on_login_page(page: Any) -> bool:
     return False
 
 
-async def _try_sso_login(
-    page: Any, username: str, password: str, db_name: str
-) -> None:
+async def _try_sso_login(page: Any, username: str, password: str, db_name: str) -> None:
     """
     Fill and submit an institutional SSO form.
 
@@ -362,43 +461,50 @@ async def _scrape_wos(
     db_config: DatabaseConfig,
     search_base: str = "https://www.webofscience.com",
 ) -> list[PaperRecord]:
+    """WoS advanced search — accepts TS= field-tagged query strings."""
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
 
     records: list[PaperRecord] = []
     max_results = db_config.max_results_per_query
-    search_url = f"{search_base.rstrip('/')}/wos/woscc/basic-search"
+    search_url = f"{search_base.rstrip('/')}/wos/woscc/advanced-search"
 
     try:
         await page.goto(search_url, timeout=30000)
         await page.wait_for_load_state("networkidle", timeout=20000)
         await asyncio.sleep(3)
 
-        search_input = None
+        # Advanced search uses a textarea for the full query expression
+        query_input = None
         for sel in (
-            'input[name="search-main-box"]',
-            'input[placeholder*="search" i]',
-            'textarea[name="value"]',
-            "#search-option",
+            "textarea.mat-input-element",
+            "#advancedSearchInputArea",
+            'textarea[data-ng-model="advancedSearchQueryText"]',
+            'textarea[placeholder*="Enter" i]',
+            'textarea[aria-label*="search" i]',
+            "textarea",
         ):
             if await page.query_selector(sel):
-                search_input = sel
+                query_input = sel
                 break
 
-        if not search_input:
+        if not query_input:
             logger.warning(
-                "Web of Science: search box not found — authentication may have failed"
+                "Web of Science: advanced search textarea not found "
+                "— authentication may have failed"
             )
             return []
 
-        await page.fill(search_input, query)
+        await page.fill(query_input, query)
         await asyncio.sleep(1)
 
         for btn_sel in (
             'button[data-ta="run-search"]',
+            'button[aria-label*="Search" i]',
             'button[type="submit"]',
             ".search-button",
+            'button:has-text("Search")',
         ):
             btn = await page.query_selector(btn_sel)
             if btn:
@@ -471,23 +577,27 @@ async def _scrape_scopus(
     db_config: DatabaseConfig,
     search_base: str = "https://www.scopus.com",
 ) -> list[PaperRecord]:
+    """Scopus advanced search — accepts TITLE-ABS-KEY() field-tagged queries."""
     from playwright.async_api import Page
 
     assert isinstance(page, Page)
 
     records: list[PaperRecord] = []
     max_results = db_config.max_results_per_query
-    search_url = f"{search_base.rstrip('/')}/search/form.uri?display=basic"
+    search_url = f"{search_base.rstrip('/')}/search/form.uri?display=advanced"
 
     try:
         await page.goto(search_url, timeout=30000)
         await page.wait_for_load_state("networkidle", timeout=20000)
         await asyncio.sleep(3)
 
+        # Advanced search has a single textarea for the full query string
         for sel in (
             "#searchfield",
-            'textarea[name="searchterm1"]',
-            'input[name="query"]',
+            'textarea[name="query"]',
+            'textarea[placeholder*="Enter" i]',
+            'textarea[aria-label*="search" i]',
+            "textarea",
         ):
             el = await page.query_selector(sel)
             if el:
@@ -498,6 +608,7 @@ async def _scrape_scopus(
             'button[data-testid="submit-search"]',
             'button[type="submit"]',
             "#searchBtn",
+            'button:has-text("Search")',
         ):
             btn = await page.query_selector(btn_sel)
             if btn:
