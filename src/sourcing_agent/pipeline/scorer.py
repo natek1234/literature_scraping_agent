@@ -328,6 +328,37 @@ async def _score_single(
     return scored
 
 
+# Canonical section tags — LLMs frequently emit the short code only (e.g. "S4e"
+# instead of "S4e:interaction"). _normalize_section_tag() expands short codes so
+# the coverage check and Zotero subcollection writes always see consistent strings.
+_SECTION_CANONICAL: dict[str, str] = {
+    "S1": "S1:introduction",
+    "S2": "S2:history",
+    "S3": "S3:ai-in-space",
+    "S3a": "S3a:ai-space-robotics",
+    "S3b": "S3b:ai-spacecraft",
+    "S4": "S4:ai-in-robotics",
+    "S4a": "S4a:navigation",
+    "S4b": "S4b:perception",
+    "S4c": "S4c:reasoning",
+    "S4d": "S4d:planning",
+    "S4e": "S4e:interaction",
+    "S4f": "S4f:learning",
+    "S4g": "S4g:alignment",
+    "S5": "S5:new-paradigms",
+    "S5a": "S5a:multimodality",
+    "S5b": "S5b:machine-brain",
+    "S5c": "S5c:integration-protocols",
+    "S6": "S6:future-directions",
+}
+
+
+def _normalize_section_tag(tag: str | None) -> str | None:
+    if not tag or tag == "null":
+        return None
+    return _SECTION_CANONICAL.get(tag, tag)
+
+
 def _apply_scoring(paper: PaperRecord, data: dict, config: Config) -> PaperRecord:
     section_fit = float(data.get("section_fit_score") or 0.0)
     contribution = float(data.get("contribution_score") or 0.0)
@@ -354,10 +385,17 @@ def _apply_scoring(paper: PaperRecord, data: dict, config: Config) -> PaperRecor
     if confidence in ("null", ""):
         confidence = None
 
-    secondary = data.get("secondary_sections") or []
-    secondary = [s for s in secondary if s and s != "null"]
+    primary_section = _normalize_section_tag(data.get("primary_section"))
 
-    is_cross_cutting = len({data.get("primary_section", ""), *secondary} - {""}) >= 3
+    secondary_raw = data.get("secondary_sections") or []
+    secondary = [
+        norm
+        for s in secondary_raw
+        if s and s != "null"
+        if (norm := _normalize_section_tag(s)) is not None
+    ]
+
+    is_cross_cutting = len({primary_section or "", *secondary} - {""}) >= 3
 
     mission = data.get("mission_or_system_name")
     if mission == "null":
@@ -368,7 +406,7 @@ def _apply_scoring(paper: PaperRecord, data: dict, config: Config) -> PaperRecor
 
     return paper.model_copy(
         update={
-            "primary_section": data.get("primary_section"),
+            "primary_section": primary_section,
             "secondary_sections": secondary,
             "kunze_dimension": kunze_dim,
             "technique_cluster": cluster,
