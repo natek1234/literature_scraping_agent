@@ -100,7 +100,19 @@ def build_supplementary_queries(
     section_tag: str,
     config: Config,
 ) -> dict[str, list[str]]:
-    """Build targeted supplementary queries for a single undercovered section."""
+    """Build targeted supplementary queries for a single undercovered section.
+
+    Returns {} for parent sections (S4:ai-in-robotics, S5:new-paradigms) — these
+    aggregate child sections that have their own targeted clusters.
+    """
+    _PARENT_SECTIONS = {"S4:ai-in-robotics", "S5:new-paradigms"}
+    if section_tag in _PARENT_SECTIONS:
+        logger.debug(
+            f"Skipping supplementary queries for parent section {section_tag} "
+            "— target the subsections directly"
+        )
+        return {}
+
     cluster_map: dict[str, str] = {
         "S1:introduction": "space_history_cluster",
         "S2:history": "space_history_cluster",
@@ -188,22 +200,27 @@ def _format_term(term: str) -> str:
 
 
 def _build_wos_query(tier1_terms: list[str], cluster_terms: list[str]) -> str:
-    """WoS advanced search: TS= field tags, shortened cluster phrases."""
-    t1 = " OR ".join(_format_term(t) for t in tier1_terms)
+    """WoS advanced search: TS= field tags, shortened cluster phrases.
+
+    tier1_terms are full boolean expressions (e.g. "autonomous robot OR robotic
+    autonomy OR autonomous robotics") — pass them through unchanged so the OR
+    operators are not mangled by _format_term / _shorten_term.
+    """
+    t1 = " OR ".join(tier1_terms)
     cl = " OR ".join(_format_term(t) for t in cluster_terms)
     return f"TS=({t1}) AND TS=({cl})"
 
 
 def _build_scopus_query(tier1_terms: list[str], cluster_terms: list[str]) -> str:
-    """Scopus advanced search: TITLE-ABS-KEY() field tags, shortened phrases."""
-    t1 = " OR ".join(_format_term(t) for t in tier1_terms)
+    """Scopus advanced search: TITLE-ABS-KEY() field tags, shortened cluster phrases."""
+    t1 = " OR ".join(tier1_terms)
     cl = " OR ".join(_format_term(t) for t in cluster_terms)
     return f"TITLE-ABS-KEY({t1}) AND TITLE-ABS-KEY({cl})"
 
 
 def _build_ieee_query(tier1_terms: list[str], cluster_terms: list[str]) -> str:
-    """IEEE/ACM basic search: boolean OR groups, shortened phrases, no 5-7 word exact strings."""
-    t1 = " OR ".join(_format_term(t) for t in tier1_terms)
+    """IEEE/ACM basic search: boolean OR groups, shortened cluster phrases."""
+    t1 = " OR ".join(tier1_terms)
     cl = " OR ".join(_format_term(t) for t in cluster_terms)
     return f"({t1}) AND ({cl})"
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
+import signal
 import sys
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
@@ -99,8 +102,58 @@ def _setup_logging(log_file: str) -> None:
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 
-async def run(context_path: str = "CONTEXT.md") -> None:
+async def run(
+    context_path: str = "CONTEXT.md",
+    only_dbs: list[str] | None = None,
+) -> None:
     from .config import Config
+
+    config = Config.from_file(context_path)
+    _setup_logging(config.output.log_file)
+
+    # ── PID lockfile — prevent multiple pipeline instances ────────────────────
+    lock_path = (
+        Path(os.path.dirname(config.output.progress_file) or "outputs")
+        / "pipeline.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.exists():
+        try:
+            old_pid = int(lock_path.read_text().strip())
+            # Check if the process is still running (POSIX: signal 0; Windows: os.kill raises)
+            os.kill(old_pid, 0)
+            logger.error(
+                f"Pipeline already running (PID {old_pid}). "
+                f"Kill it first, or delete {lock_path} if it's stale."
+            )
+            sys.exit(1)
+        except (ProcessLookupError, PermissionError, ValueError):
+            lock_path.unlink(missing_ok=True)
+
+    lock_path.write_text(str(os.getpid()))
+
+    def _release_lock(*_: object) -> None:
+        lock_path.unlink(missing_ok=True)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _release_lock)
+        except (OSError, ValueError):
+            pass
+
+    try:
+        await _run_pipeline(
+            config=config,
+            only_dbs=only_dbs,
+        )
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+async def _run_pipeline(
+    config: Config,
+    only_dbs: list[str] | None = None,
+) -> None:
     from .output.excel_writer import write_to_excel
     from .output.zotero_writer import write_to_zotero
     from .pipeline.deduplicator import deduplicate
@@ -109,8 +162,6 @@ async def run(context_path: str = "CONTEXT.md") -> None:
     from .progress import ProgressTracker
     from .summary import SummaryWriter
 
-    config = Config.from_file(context_path)
-    _setup_logging(config.output.log_file)
     progress = ProgressTracker(config.output.progress_file)
     progress.load_or_init(config.project_title)
 
@@ -146,6 +197,10 @@ async def run(context_path: str = "CONTEXT.md") -> None:
         if not db.enabled:
             continue
 
+        # --db filter: if the user specified databases, skip all others
+        # (but always load from cache — only skip live re-query)
+        db_restricted = only_dbs is not None and db.name not in only_dbs
+
         step_key = f"{db.name.lower().replace(' ', '_')}_queried"
         db_cache = _db_cache_path(out_dir, db.name)
 
@@ -162,6 +217,11 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                 continue
             except Exception as e:
                 logger.warning(f"  {db.name}: cache load failed ({e}) — re-querying")
+
+        # --db filter: if restricted and not cached, skip live query
+        if db_restricted:
+            logger.info(f"  {db.name}: skipped (not in --db filter)")
+            continue
 
         # Skip paywalled DBs that have no credentials — do NOT save cache or mark
         # the step complete so that adding credentials later and resuming will
@@ -315,6 +375,9 @@ async def run(context_path: str = "CONTEXT.md") -> None:
             )
 
     # ── Step 5: Coverage check + supplementary queries ────────────────────────
+    # Max supplementary results scored per section — prevents overnight scoring runs
+    _SUPP_MAX_PER_SECTION = 50
+
     if not progress.is_step_complete("coverage_checked"):
         undercovered = _check_section_coverage(all_records, config)
         if undercovered:
@@ -322,6 +385,14 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                 f"  Section undercoverage: {undercovered} — running supplementary queries"
             )
             for section_tag in undercovered:
+                # Per-section checkpoint: skip sections already done in a prior run
+                supp_step = f"coverage_supp_{section_tag.replace(':', '_')}"
+                if progress.is_step_complete(supp_step):
+                    logger.info(
+                        f"  Supplementary [{section_tag}]: already done — skipping"
+                    )
+                    continue
+
                 supp_queries = build_supplementary_queries(section_tag, config)
                 supp_records: list[PaperRecord] = []
 
@@ -344,6 +415,14 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                             logger.error(f"Supplementary query failed: {e}")
 
                 if supp_records:
+                    # Cap to avoid multi-hour scoring runs on large result sets
+                    if len(supp_records) > _SUPP_MAX_PER_SECTION:
+                        logger.info(
+                            f"  Supplementary [{section_tag}]: "
+                            f"{len(supp_records)} candidates — capping at {_SUPP_MAX_PER_SECTION}"
+                        )
+                        supp_records = supp_records[:_SUPP_MAX_PER_SECTION]
+
                     all_records.extend(supp_records)
                     all_records = deduplicate(all_records, config)
                     supp_scored = await score_papers(
@@ -356,6 +435,9 @@ async def run(context_path: str = "CONTEXT.md") -> None:
                     logger.info(
                         f"  Supplementary: +{len(supp_scored):,} records for {section_tag}"
                     )
+
+                # Checkpoint after each section so a restart doesn't re-score it
+                progress.write_checkpoint(supp_step, {"added": len(supp_records)})
 
         progress.write_checkpoint("coverage_checked", {"undercovered": undercovered})
 
@@ -558,8 +640,28 @@ def _print_final_summary(
 
 
 def cli() -> None:
-    asyncio.run(run())
+    parser = argparse.ArgumentParser(
+        description="Literature sourcing agent for systematic review"
+    )
+    parser.add_argument(
+        "--db",
+        metavar="DATABASE",
+        action="append",
+        dest="only_dbs",
+        help=(
+            "Restrict live queries to this database (repeatable). "
+            "Already-cached DBs are always loaded regardless. "
+            "Example: --db 'Web of Science' --db 'Scopus'"
+        ),
+    )
+    parser.add_argument(
+        "--context",
+        default="CONTEXT.md",
+        help="Path to CONTEXT.md (default: CONTEXT.md)",
+    )
+    args = parser.parse_args()
+    asyncio.run(run(context_path=args.context, only_dbs=args.only_dbs))
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    cli()

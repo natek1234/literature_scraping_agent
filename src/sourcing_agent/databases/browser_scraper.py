@@ -591,21 +591,87 @@ async def _scrape_scopus(
         await page.wait_for_load_state("networkidle", timeout=20000)
         await asyncio.sleep(3)
 
-        # Advanced search has a single textarea for the full query string
+        filled = False
+
+        # Strategy 1: plain textarea selectors (works when Scopus renders a
+        # standard <textarea> for the advanced query box)
         for sel in (
-            "#searchfield",
-            'textarea[name="query"]',
+            'textarea[id*="query" i]',
+            'textarea[name*="query" i]',
+            "#advancedSearchInput",
+            "#queryField",
             'textarea[placeholder*="Enter" i]',
             'textarea[aria-label*="search" i]',
+            'textarea[aria-label*="query" i]',
             "textarea",
         ):
             el = await page.query_selector(sel)
             if el:
                 await page.fill(sel, query)
+                filled = True
+                logger.debug(f"Scopus: filled query via textarea selector '{sel}'")
                 break
+
+        # Strategy 2: CodeMirror editor — Scopus advanced search sometimes
+        # renders a CodeMirror widget whose underlying <textarea> is hidden.
+        # We set the value through the CodeMirror JavaScript API.
+        if not filled:
+            cm_set = await page.evaluate(
+                """(query) => {
+                    const cm = document.querySelector('.CodeMirror');
+                    if (cm && cm.CodeMirror) {
+                        cm.CodeMirror.setValue(query);
+                        return true;
+                    }
+                    return false;
+                }""",
+                query,
+            )
+            if cm_set:
+                filled = True
+                logger.debug("Scopus: filled query via CodeMirror JS API")
+
+        # Strategy 3: contenteditable div (React / draft.js patterns)
+        if not filled:
+            ce = await page.query_selector(
+                '[contenteditable="true"][aria-label*="search" i], '
+                '[contenteditable="true"][role="textbox"]'
+            )
+            if ce:
+                await ce.click()
+                await page.keyboard.press("Control+a")
+                await page.keyboard.type(query)
+                filled = True
+                logger.debug("Scopus: filled query via contenteditable div")
+
+        if not filled:
+            # Dump visible input/textarea tags to help diagnose selector mismatches
+            inputs = await page.evaluate(
+                """() => {
+                    const tags = ['input','textarea','[contenteditable]'];
+                    return tags.flatMap(t =>
+                        [...document.querySelectorAll(t)].map(el => ({
+                            tag: el.tagName,
+                            id: el.id,
+                            name: el.name || '',
+                            type: el.type || '',
+                            placeholder: el.placeholder || '',
+                            ariaLabel: el.getAttribute('aria-label') || ''
+                        }))
+                    );
+                }"""
+            )
+            logger.warning(
+                f"Scopus: no query input found on advanced search page. "
+                f"Visible inputs: {inputs}"
+            )
+            return []
+
+        await asyncio.sleep(1)
 
         for btn_sel in (
             'button[data-testid="submit-search"]',
+            'button[data-ta="run-search"]',
             'button[type="submit"]',
             "#searchBtn",
             'button:has-text("Search")',
@@ -619,7 +685,8 @@ async def _scrape_scopus(
         await asyncio.sleep(3)
 
         result_items = await page.query_selector_all(
-            'article[data-testid="result-item"], .searchArea .resultRow'
+            'article[data-testid="result-item"], .searchArea .resultRow, '
+            'li[data-testid="result-item"]'
         )
 
         for item in result_items[:max_results]:
