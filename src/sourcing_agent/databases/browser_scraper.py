@@ -166,34 +166,58 @@ async def search_batch(
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            try:
-                context, search_base = await _get_authenticated_context(
-                    browser, db_config, username, password, proxy_url
-                )
-                for idx, query in enumerate(queries):
-                    page = await context.new_page()
-                    try:
-                        records = await _scrape_db(
-                            page, name, search_base, query, db_config, config
+            context, search_base = await _get_authenticated_context(
+                browser, db_config, username, password, proxy_url
+            )
+            remaining = list(enumerate(queries))
+            while remaining:
+                idx, query = remaining[0]
+                remaining = remaining[1:]
+                page = await context.new_page()
+                expired = False
+                try:
+                    records = await _scrape_db(
+                        page, name, search_base, query, db_config, config
+                    )
+
+                    # Mid-run session expiry: 0 results AND page is a login form
+                    if not records and await _is_on_login_page(page):
+                        logger.warning(
+                            f"{name}: session expired at query {idx + 1} "
+                            "— prompting re-authentication"
                         )
+                        expired = True
+                    else:
                         all_records.extend(records)
                         logger.info(
                             f"{name}: query {idx + 1}/{len(queries)} "
                             f"→ {len(records)} records"
                         )
-                        # Refresh saved session so cookie expiry resets on each use
                         await _save_session(context, name)
-                    except Exception as exc:
-                        logger.error(
-                            f"{name}: query {idx + 1}/{len(queries)} failed — {exc}"
-                        )
-                    finally:
-                        await page.close()
+                except Exception as exc:
+                    logger.error(
+                        f"{name}: query {idx + 1}/{len(queries)} failed — {exc}"
+                    )
+                finally:
+                    await page.close()
 
-                    if idx < len(queries) - 1:
-                        await asyncio.sleep(3)
-            finally:
-                await browser.close()
+                if expired:
+                    # Close stale browser, prompt fresh login, reopen headless
+                    await context.close()
+                    await browser.close()
+                    await prompt_and_save_session(name, proxy_url)
+                    browser = await p.chromium.launch(headless=True)
+                    context, search_base = await _get_authenticated_context(
+                        browser, db_config, username, password, proxy_url
+                    )
+                    # Put the failed query back at the front so it is retried
+                    remaining = [(idx, query), *remaining]
+                    continue
+
+                if remaining:
+                    await asyncio.sleep(3)
+
+            await browser.close()
     except Exception as exc:
         logger.error(f"{name}: playwright launch failed — {exc}")
 
@@ -426,6 +450,45 @@ async def _save_session(context: Any, db_name: str) -> None:
         logger.warning(f"{db_name}: could not save session — {exc}")
 
 
+async def prompt_and_save_session(db_name: str, proxy_url: str) -> None:
+    """Open a headed browser for db_name, wait for the user to log in, save session.
+
+    Called by the pipeline before every paywalled database query (fresh auth
+    is always required — sessions are never reused across runs).  Also called
+    mid-run if auth expiry is detected during scraping.
+
+    The user completes SSO + Duo MFA in the headed window, navigates to the
+    search page, then presses Enter here to persist the session.
+    """
+    from playwright.async_api import async_playwright
+
+    search_path = _SEARCH_PATHS.get(db_name, "/")
+    base = proxy_url.rstrip("/") if proxy_url else _DIRECT_BASES.get(db_name, "")
+    start_url = f"{base}{search_path}"
+
+    print(
+        f"\n{'='*60}\n"
+        f"  Auth required: {db_name}\n"
+        f"  Opening: {start_url}\n"
+        f"  1. Log in (SSO + Duo MFA if prompted)\n"
+        f"  2. Navigate to the search/advanced-search page\n"
+        f"  3. Press Enter here once you are on the search page\n"
+        f"{'='*60}"
+    )
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        try:
+            context = await browser.new_context(user_agent=_USER_AGENT)
+            page = await context.new_page()
+            await page.goto(start_url, timeout=60_000)
+            input("  [Press Enter once you are on the search page] ")
+            await _save_session(context, db_name)
+            logger.info(f"{db_name}: fresh session saved via prompted login")
+        finally:
+            await browser.close()
+
+
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 
@@ -646,8 +709,7 @@ async def _scrape_scopus(
 
         if not filled:
             # Dump visible input/textarea tags to help diagnose selector mismatches
-            inputs = await page.evaluate(
-                """() => {
+            inputs = await page.evaluate("""() => {
                     const tags = ['input','textarea','[contenteditable]'];
                     return tags.flatMap(t =>
                         [...document.querySelectorAll(t)].map(el => ({
@@ -659,8 +721,7 @@ async def _scrape_scopus(
                             ariaLabel: el.getAttribute('aria-label') || ''
                         }))
                     );
-                }"""
-            )
+                }""")
             logger.warning(
                 f"Scopus: no query input found on advanced search page. "
                 f"Visible inputs: {inputs}"

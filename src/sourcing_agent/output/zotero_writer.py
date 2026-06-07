@@ -239,6 +239,10 @@ def _write_record(
     }
 
     resp = z.create_items([item])
+    failed = resp.get("failed", {})
+    if failed:
+        reasons = [str(v) for v in failed.values()]
+        raise RuntimeError(f"Zotero rejected item '{record.title[:60]}': {reasons}")
     item_key = resp.get("successful", {}).get("0", {}).get("key", "")
 
     if item_key and config.output.zotero.add_abstract_note:

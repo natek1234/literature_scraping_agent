@@ -5,6 +5,7 @@
 
 # ── Generated outputs (never commit) ─────────────────────────────────────────
 outputs/
+archive/
 
 # ── Claude Code personal settings (machine-specific) ─────────────────────────
 .claude/settings.local.json

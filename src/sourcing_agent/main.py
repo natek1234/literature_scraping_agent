@@ -257,7 +257,16 @@ async def _run_pipeline(
                     logger.error(f"{db.name}: query failed — {e}")
 
         elif db.type == "paywalled_browser":
-            from .databases.browser_scraper import search_batch as browser_search_batch
+            from .databases.browser_scraper import (
+                prompt_and_save_session,
+            )
+            from .databases.browser_scraper import (
+                search_batch as browser_search_batch,
+            )
+
+            # Always require a fresh login — never reuse a saved session across runs.
+            proxy_url = os.environ.get(db.credential_env_vars.get("proxy", ""), "")
+            await prompt_and_save_session(db.name, proxy_url)
 
             try:
                 db_records = await browser_search_batch(db, db_queries, config)

@@ -58,13 +58,7 @@ def build_queries(config: Config) -> dict[str, list[str]]:
                 continue
 
             if name in ("Semantic Scholar", "arXiv", "NASA Technical Reports Server"):
-                # S2 and arXiv work best with natural language cluster terms.
-                # S2 rejects complex boolean; arXiv's category filter already scopes
-                # the discipline, so boolean strings are redundant.
-                # NTRS uses Elasticsearch in "all-terms-must-match" mode: 5+ words
-                # returns 0 results, so cap at 3 cluster terms.
-                limit = 3 if name == "NASA Technical Reports Server" else 6
-                full_query = " ".join(cluster_terms[:limit])
+                full_query = _build_natural_query(name, cluster_terms)
             elif name == "Web of Science":
                 full_query = _build_wos_query(config.keywords_tier_1, cluster_terms)
             elif name == "Scopus":
@@ -172,8 +166,9 @@ def build_supplementary_queries(
         for db in enabled_dbs:
             name = db.name
             if name in ("Semantic Scholar", "arXiv", "NASA Technical Reports Server"):
-                limit = 3 if name == "NASA Technical Reports Server" else 6
-                result.setdefault(name, []).append(" ".join(cluster_terms[:limit]))
+                result.setdefault(name, []).append(
+                    _build_natural_query(name, cluster_terms)
+                )
             elif name == "Web of Science":
                 result.setdefault(name, []).append(
                     _build_wos_query(config.keywords_tier_1, cluster_terms)
@@ -200,6 +195,20 @@ def build_supplementary_queries(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _build_natural_query(db_name: str, cluster_terms: list[str]) -> str:
+    """Build a plain-text query for S2, arXiv, and NTRS.
+
+    S2 and arXiv accept up to 6 natural-language terms joined by spaces.
+    NTRS uses Elasticsearch in strict all-terms-must-match mode and returns
+    zero results for queries longer than ~4 words, so we use only the first
+    cluster term (a short 2-4 word phrase) as the entire query.
+    """
+    if db_name == "NASA Technical Reports Server":
+        first = cluster_terms[0] if cluster_terms else ""
+        return " ".join(first.split()[:4])
+    return " ".join(cluster_terms[:6])
 
 
 def _quote(term: str, db_name: str) -> str:
