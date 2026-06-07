@@ -102,8 +102,9 @@ def build_supplementary_queries(
 ) -> dict[str, list[str]]:
     """Build targeted supplementary queries for a single undercovered section.
 
-    Returns {} for parent sections (S4:ai-in-robotics, S5:new-paradigms) — these
-    aggregate child sections that have their own targeted clusters.
+    Returns one query per cluster per database. Sections may map to multiple
+    clusters — the supplementary loop in main.py runs all of them.
+    Returns {} for parent sections that have no targeted clusters.
     """
     _PARENT_SECTIONS = {"S4:ai-in-robotics", "S5:new-paradigms"}
     if section_tag in _PARENT_SECTIONS:
@@ -113,52 +114,87 @@ def build_supplementary_queries(
         )
         return {}
 
-    cluster_map: dict[str, str] = {
-        "S1:introduction": "space_history_cluster",
-        "S2:history": "space_history_cluster",
-        "S3:ai-in-space": "ai_space_cluster",
-        "S3a:ai-space-robotics": "ai_space_cluster",
-        "S3b:ai-spacecraft": "ai_space_cluster",
-        "S4a:navigation": "navigation_cluster",
-        "S4b:perception": "perception_cluster",
-        "S4c:reasoning": "reasoning_cluster",
-        "S4d:planning": "planning_cluster",
-        "S4e:interaction": "interaction_cluster",
-        "S4f:learning": "learning_cluster",
-        "S4g:alignment": "alignment_cluster",
-        "S5a:multimodality": "multimodal_cluster",
-        "S5b:machine-brain": "machine_brain_cluster",
-        "S5c:integration-protocols": "integration_cluster",
-        "S6:future-directions": "future_cluster",
+    # 1:many mapping — each section may have multiple targeted clusters.
+    # Sections with a single broad cluster keep a one-element list.
+    cluster_map: dict[str, list[str]] = {
+        "S1:introduction": ["space_history_cluster"],
+        "S2:history": [
+            "s2_early_space_computers",
+            "s2_mars_rover_systems",
+            "s2_modern_space_systems",
+            "s2_space_robotics_surveys",
+        ],
+        "S3:ai-in-space": [
+            "s3_deployed_rover_intelligence",
+            "s3_spacecraft_autonomous_systems",
+            "s3_near_deployment_systems",
+        ],
+        "S3a:ai-space-robotics": ["ai_space_cluster"],
+        "S3b:ai-spacecraft": ["ai_space_cluster"],
+        "S4a:navigation": ["navigation_cluster"],
+        "S4b:perception": ["perception_cluster"],
+        "S4c:reasoning": ["reasoning_cluster"],
+        "S4d:planning": ["planning_cluster"],
+        "S4e:interaction": ["interaction_cluster"],
+        "S4f:learning": ["learning_cluster"],
+        "S4g:alignment": [
+            "alignment_foundation",
+            "alignment_reward_specification",
+            "alignment_emergent_agentic",
+            "alignment_scalable_oversight",
+            "alignment_safe_rl_robotics",
+            "alignment_embodied_robotics",
+        ],
+        "S5a:multimodality": ["multimodal_cluster"],
+        "S5b:machine-brain": ["machine_brain_cluster"],
+        "S5c:integration-protocols": ["integration_cluster"],
+        "S6:future-directions": ["future_cluster"],
     }
 
-    cluster_name = cluster_map.get(section_tag)
-    if not cluster_name or cluster_name not in config.keywords_tier_2:
+    cluster_names = cluster_map.get(section_tag)
+    if not cluster_names:
         logger.warning(f"No cluster mapping for section {section_tag}")
         return {}
 
-    cluster_terms = config.keywords_tier_2[cluster_name]
     result: dict[str, list[str]] = {}
-
     enabled_dbs = [db for db in config.databases if db.enabled]
-    for db in enabled_dbs:
-        name = db.name
-        if name in ("Semantic Scholar", "arXiv", "NASA Technical Reports Server"):
-            limit = 3 if name == "NASA Technical Reports Server" else 6
-            result[name] = [" ".join(cluster_terms[:limit])]
-        elif name == "Web of Science":
-            result[name] = [_build_wos_query(config.keywords_tier_1, cluster_terms)]
-        elif name == "Scopus":
-            result[name] = [_build_scopus_query(config.keywords_tier_1, cluster_terms)]
-        elif name in ("IEEE Xplore", "ACM Digital Library"):
-            result[name] = [_build_ieee_query(config.keywords_tier_1, cluster_terms)]
-        else:
-            and_op = _AND.get(name, " AND ")
-            or_op = _OR.get(name, " OR ")
-            tier1_parts = [_quote(t, name) for t in config.keywords_tier_1]
-            base_query = and_op.join(tier1_parts)
-            cluster_part = f"({or_op.join(_quote(t, name) for t in cluster_terms)})"
-            result[name] = [f"{base_query}{and_op}{cluster_part}"]
+
+    for cluster_name in cluster_names:
+        if cluster_name not in config.keywords_tier_2:
+            logger.warning(
+                f"Cluster {cluster_name!r} not found in config "
+                f"(section {section_tag}) — skipping"
+            )
+            continue
+
+        cluster_terms = config.keywords_tier_2[cluster_name]
+
+        for db in enabled_dbs:
+            name = db.name
+            if name in ("Semantic Scholar", "arXiv", "NASA Technical Reports Server"):
+                limit = 3 if name == "NASA Technical Reports Server" else 6
+                result.setdefault(name, []).append(" ".join(cluster_terms[:limit]))
+            elif name == "Web of Science":
+                result.setdefault(name, []).append(
+                    _build_wos_query(config.keywords_tier_1, cluster_terms)
+                )
+            elif name == "Scopus":
+                result.setdefault(name, []).append(
+                    _build_scopus_query(config.keywords_tier_1, cluster_terms)
+                )
+            elif name in ("IEEE Xplore", "ACM Digital Library"):
+                result.setdefault(name, []).append(
+                    _build_ieee_query(config.keywords_tier_1, cluster_terms)
+                )
+            else:
+                and_op = _AND.get(name, " AND ")
+                or_op = _OR.get(name, " OR ")
+                tier1_parts = [_quote(t, name) for t in config.keywords_tier_1]
+                base_query = and_op.join(tier1_parts)
+                cluster_part = f"({or_op.join(_quote(t, name) for t in cluster_terms)})"
+                result.setdefault(name, []).append(
+                    f"{base_query}{and_op}{cluster_part}"
+                )
 
     return result
 

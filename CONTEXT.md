@@ -1015,6 +1015,157 @@ KEYWORDS:
         - "robot autonomy evaluation benchmark"
         - "NASA ESA autonomy roadmap"
 
+      # ══════════════════════════════════════════════════════════════════
+      # SUPPLEMENTARY CLUSTERS — targeted queries for undercovered sections
+      # These run only through the supplementary query mechanism, not the
+      # main database sweep. Each cluster is mission-specific or concept-
+      # specific enough to surface papers the broad tier-2 queries miss.
+      # ══════════════════════════════════════════════════════════════════
+
+      # ── S2: Early space computers and probes (1960s–1990s) ───────────
+      # Targets: Apollo GC, Viking landers, Voyager, Remote Agent/DS1
+      # Primary DBs: NASA NTRS (technical reports), IEEE AERO, S2
+      s2_early_space_computers:
+        - "Apollo guidance computer"
+        - "Viking lander autonomy"
+        - "Voyager spacecraft automation"
+        - "Remote Agent Deep Space"
+        - "early spacecraft fault protection"
+
+      # ── S2: Mars rover systems (Sojourner through Curiosity/AEGIS) ───
+      # Targets: Sojourner, MER Spirit/Opportunity, MRO, AEGIS, AutoNav
+      # Primary DBs: NASA NTRS, IEEE AERO, Journal of Field Robotics, S2
+      s2_mars_rover_systems:
+        - "Mars rover autonomy"
+        - "AEGIS autonomous science"
+        - "AutoNav terrain navigation"
+        - "Sojourner Pathfinder rover"
+        - "Spirit Opportunity MER"
+        - "Mars Reconnaissance Orbiter"
+
+      # ── S2: Modern space systems (Curiosity MSL onwards) ─────────────
+      # Targets: Curiosity MSL, Perseverance, Ingenuity, Canadarm2/Dextre, CIMON
+      # Primary DBs: S2, IEEE AERO, Science Robotics, RA-L
+      s2_modern_space_systems:
+        - "Curiosity MSL rover"
+        - "Perseverance rover AI"
+        - "Ingenuity helicopter Mars"
+        - "Canadarm Dextre SSRMS"
+        - "CIMON ISS cognitive"
+        - "ISS robotic assembly"
+
+      # ── S2: Survey and synthesis papers ──────────────────────────────
+      # Targets: survey papers mapping space robotics autonomy evolution
+      # Primary DBs: S2, IEEE, WoS
+      s2_space_robotics_surveys:
+        - "space robotics autonomy survey"
+        - "planetary rover systems review"
+        - "autonomous spacecraft history"
+        - "space mission AI history"
+        - "orbital robotics development"
+
+      # ── S3: Deployed AI in space robotics ────────────────────────────
+      # Targets: AEGIS operational papers, AutoNav, Terrain Relative Navigation
+      # Differentiator from S3a: "onboard", "flight", "heritage" vocabulary
+      # Primary DBs: NASA NTRS, S2, IEEE AERO
+      s3_deployed_rover_intelligence:
+        - "AEGIS onboard science targeting"
+        - "Terrain Relative Navigation Mars"
+        - "autonomous navigation Mars rover flight"
+        - "onboard image classification space"
+        - "rover autonomous traverse flight"
+        - "Mars 2020 autonomous systems"
+
+      # ── S3: Deployed AI in spacecraft systems ────────────────────────
+      # Targets: CASPER scheduling, fault detection on Cassini/MSL, EO-1
+      # Primary DBs: NASA NTRS, S2, IEEE AERO
+      s3_spacecraft_autonomous_systems:
+        - "autonomous fault detection spacecraft"
+        - "CASPER activity planning space"
+        - "onboard autonomy spacecraft operations"
+        - "autonomous scheduling space mission"
+        - "model-based fault diagnosis spacecraft"
+        - "deep space autonomy operations"
+
+      # ── S3: Near-deployment and future space systems ──────────────────
+      # Targets: ExoMars, CIMON-2, Lunar Gateway, upcoming systems
+      # Primary DBs: S2, IEEE, WoS
+      s3_near_deployment_systems:
+        - "ExoMars rover autonomy"
+        - "CIMON cognitive architecture space"
+        - "lunar surface robotics AI"
+        - "Gateway robotic systems"
+        - "autonomous docking capture spacecraft"
+
+      # ── S4g: Foundational alignment papers ───────────────────────────
+      # Targets: Ngo (2022), Hubinger (2019), Langosco (2022), Amodei (2016)
+      # Primary DBs: arXiv cs.AI/cs.LG, S2 (NeurIPS/ICML proceedings)
+      alignment_foundation:
+        - "AI alignment deep learning"
+        - "learned optimization inner alignment"
+        - "goal misgeneralisation distributional shift"
+        - "concrete problems AI safety"
+        - "mesa-optimizer deceptive alignment"
+        - "specification problem machine learning"
+
+      # ── S4g: Reward specification and gaming ─────────────────────────
+      # Targets: Skalse (2022), Baker (2025), Krakovna specification gaming
+      # Primary DBs: arXiv cs.AI/cs.LG, S2 (NeurIPS)
+      alignment_reward_specification:
+        - "reward hacking reinforcement learning"
+        - "specification gaming reward model"
+        - "proxy objective misspecification"
+        - "reward shaping misalignment"
+        - "Goodhart law AI"
+        - "reward function corruption"
+
+      # ── S4g: Emergent and agentic misalignment ───────────────────────
+      # Targets: Betley (2025), Chan (2023), Hammond (2025), power-seeking lit.
+      # Primary DBs: arXiv cs.AI/cs.LG, S2
+      alignment_emergent_agentic:
+        - "emergent misalignment AI systems"
+        - "agentic AI harms risks"
+        - "multi-agent AI alignment"
+        - "power-seeking instrumental convergence"
+        - "deceptive alignment AI"
+        - "autonomous agent failure modes"
+
+      # ── S4g: Scalable oversight mechanisms ───────────────────────────
+      # Targets: Greenblatt AI Control (2023), Khan debate (2024),
+      #          Kenton scalable oversight (2024), Hadfield-Menell CIRL,
+      #          Irving debate, Christiano IDA
+      # Primary DBs: arXiv cs.AI, S2 (NeurIPS/ICML)
+      alignment_scalable_oversight:
+        - "scalable oversight AI"
+        - "AI control corrigibility"
+        - "debate mechanism oversight"
+        - "cooperative inverse reinforcement learning"
+        - "weak-to-strong generalization"
+        - "reward learning human feedback"
+
+      # ── S4g: Safe RL and constrained control ─────────────────────────
+      # Targets: Berkenkamp (safe RL Lyapunov), Garcia & Fernandez survey,
+      #          Moldovan & Abbeel safe exploration, Achiam CPO
+      # Primary DBs: arXiv cs.RO/cs.SY/cs.LG, S2, IEEE
+      alignment_safe_rl_robotics:
+        - "safe reinforcement learning robot"
+        - "constrained policy optimization safety"
+        - "Lyapunov stability reinforcement learning"
+        - "safe exploration constraint satisfaction"
+        - "safety constraint robot control"
+        - "risk-sensitive reinforcement learning"
+
+      # ── S4g: Embodied and compositional alignment ─────────────────────
+      # Targets: Embodied AI Security Survey (arXiv:2502.13175),
+      #          compositional misalignment, corrigibility in autonomous robots
+      # Primary DBs: arXiv cs.RO/cs.AI, S2
+      alignment_embodied_robotics:
+        - "embodied AI safety security"
+        - "compositional safety AI robot"
+        - "value alignment robot system"
+        - "corrigibility autonomous robot"
+        - "AI safety space robotics"
+
   tier_3:
     - "Perseverance rover"
     - "Curiosity rover"
