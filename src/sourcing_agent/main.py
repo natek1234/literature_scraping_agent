@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import signal
 import sys
 import time
@@ -363,11 +364,37 @@ async def _run_pipeline(
         )
     else:
         if os.path.exists(scored_cache):
-            all_records = _load_jsonl(scored_cache)
-            logger.info(
-                f"  Scoring: already complete — "
-                f"loaded {len(all_records):,} scored papers from cache"
-            )
+            scored_records = _load_jsonl(scored_cache)
+            scored_keys = {_make_record_key(r) for r in scored_records}
+            new_records = [
+                r for r in all_records if _make_record_key(r) not in scored_keys
+            ]
+            if new_records:
+                logger.info(
+                    f"  Delta scoring: {len(new_records):,} new papers "
+                    f"({len(scored_records):,} already scored — skipping)"
+                )
+                new_scored = await score_papers(
+                    new_records, config, progress, summary=summary
+                )
+                new_scored = apply_auto_rules(new_scored, config)
+                all_records = scored_records + new_scored
+                _save_jsonl(scored_cache, all_records)
+                errors = sum(
+                    1
+                    for r in new_scored
+                    if r.agent_notes and "SCORING_ERROR" in r.agent_notes
+                )
+                logger.info(
+                    f"✓ Delta scoring: +{len(new_scored):,} papers scored "
+                    f"({errors} errors)"
+                )
+            else:
+                all_records = scored_records
+                logger.info(
+                    f"  Scoring: already complete — "
+                    f"loaded {len(all_records):,} scored papers from cache"
+                )
         else:
             logger.warning(
                 "  Scoring: marked complete but scored cache missing — "
@@ -400,6 +427,27 @@ async def _run_pipeline(
                     supp_db = config.db_by_name(db_name)
                     if not supp_db or not supp_db.enabled:
                         continue
+                    if supp_db.type == "paywalled_browser":
+                        if not _browser_creds_available(supp_db):
+                            logger.warning(
+                                f"  Supplementary [{section_tag}] {db_name}: "
+                                "skipped — no credentials"
+                            )
+                            continue
+                        try:
+                            from .databases.browser_scraper import (
+                                search_batch as browser_search_batch,
+                            )
+
+                            batch = await browser_search_batch(supp_db, db_qs, config)
+                            supp_records.extend(batch)
+                        except Exception as e:
+                            logger.error(
+                                f"Supplementary [{section_tag}] {db_name} "
+                                f"browser query failed: {e}"
+                            )
+                        continue  # db_qs already consumed as a batch above
+
                     for q in db_qs:
                         try:
                             if db_name == "Semantic Scholar":
@@ -439,6 +487,8 @@ async def _run_pipeline(
                 # Checkpoint after each section so a restart doesn't re-score it
                 progress.write_checkpoint(supp_step, {"added": len(supp_records)})
 
+        # Persist augmented record set so downstream tools see all papers
+        _save_jsonl(scored_cache, all_records)
         progress.write_checkpoint("coverage_checked", {"undercovered": undercovered})
 
     # ── Step 6: Print coverage summary ────────────────────────────────────────
@@ -532,6 +582,23 @@ async def _run_pipeline(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _make_record_key(r: PaperRecord) -> str:
+    """Stable identity key for a paper. Used to detect already-scored records.
+
+    Priority: DOI > arXiv ID > S2 ID > normalised title. This mirrors the
+    deduplicator's priority so a paper is never re-scored after a dedup run
+    that promoted a canonical identifier from a duplicate.
+    """
+    if r.doi:
+        return f"doi:{r.doi.lower().strip()}"
+    if r.arxiv_id:
+        return f"arxiv:{r.arxiv_id.strip()}"
+    if r.s2_paper_id:
+        return f"s2:{r.s2_paper_id.strip()}"
+    title = re.sub(r"\W+", " ", (r.title or "").lower()).strip()
+    return f"title:{title}"
 
 
 def _check_section_coverage(records: list[Any], config: Config) -> list[str]:
