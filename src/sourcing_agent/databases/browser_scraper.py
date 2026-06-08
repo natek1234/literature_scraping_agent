@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
@@ -453,79 +454,88 @@ async def _save_session(context: Any, db_name: str) -> None:
 async def prompt_and_save_session(db_name: str, proxy_url: str) -> None:
     """Ensure a fresh browser session for db_name before querying.
 
-    TTY mode (interactive terminal): opens a headed Chromium window, waits
-    for the user to complete SSO + Duo MFA, then saves the session.
+    Tries the interactive path (headed browser + Enter prompt) first.
+    Falls back to polling automatically when stdin is not interactive or
+    when input() raises EOFError (e.g. IDE/subprocess pseudo-TTY with no
+    actual stdin data).  sys.stdin.isatty() alone is not reliable in
+    environments like the Claude Code Bash tool, which provides a pseudo-TTY
+    but no readable stdin data.
 
-    Non-TTY mode (IDE/subprocess): prints instructions asking the user to
-    run ``scripts/save_browser_session.py`` in their own terminal, then
-    polls for the session file every 5 seconds and resumes automatically
-    once a fresh session (< 5 min old) is detected.  Times out after 10 min.
+    Polling path: prints instructions to run save_browser_session.py, then
+    checks the session file every 5 s for up to 10 min and resumes once a
+    fresh session (< 5 min old) is detected.
     """
-    import sys as _sys
     import time as _time
 
-    if not _sys.stdin.isatty():
-        # ── Non-interactive: instruct + poll ────────────────────────────────
-        session_file = _session_path(db_name)
+    session_file = _session_path(db_name)
+    _use_polling = not sys.stdin.isatty()
+
+    if not _use_polling:
+        # ── Try headed browser + interactive Enter ────────────────────────────
+        from playwright.async_api import async_playwright
+
+        search_path = _SEARCH_PATHS.get(db_name, "/")
+        base = proxy_url.rstrip("/") if proxy_url else _DIRECT_BASES.get(db_name, "")
+        start_url = f"{base}{search_path}"
+
         print(
             f"\n{'='*60}\n"
-            f"  {db_name}: SSO authentication required.\n"
-            f"\n"
-            f"  In your terminal, run:\n"
-            f"    python scripts/save_browser_session.py\n"
-            f"  Select '{db_name}', complete SSO + Duo MFA,\n"
-            f"  then press Enter in that window.\n"
-            f"\n"
-            f"  The pipeline will resume automatically once\n"
-            f"  the session file is saved.\n"
-            f"{'='*60}",
-            flush=True,
+            f"  Auth required: {db_name}\n"
+            f"  Opening: {start_url}\n"
+            f"  1. Log in (SSO + Duo MFA if prompted)\n"
+            f"  2. Navigate to the search/advanced-search page\n"
+            f"  3. Press Enter here once you are on the search page\n"
+            f"{'='*60}"
         )
-        _POLL_SEC = 5
-        _TIMEOUT_SEC = 600  # 10 minutes
-        for _ in range(_TIMEOUT_SEC // _POLL_SEC):
-            await asyncio.sleep(_POLL_SEC)
-            if session_file.exists():
-                age = _time.time() - session_file.stat().st_mtime
-                if age < 300:
-                    logger.info(
-                        f"{db_name}: session file detected "
-                        f"({age:.0f}s old) — resuming"
-                    )
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            try:
+                context = await browser.new_context(user_agent=_USER_AGENT)
+                page = await context.new_page()
+                await page.goto(start_url, timeout=60_000)
+                try:
+                    input("  [Press Enter once you are on the search page] ")
+                    await _save_session(context, db_name)
+                    logger.info(f"{db_name}: fresh session saved via prompted login")
                     return
-        raise RuntimeError(
-            f"{db_name}: timed out after "
-            f"{_TIMEOUT_SEC // 60} min waiting for session file"
-        )
+                except EOFError:
+                    # Pseudo-TTY with no stdin data (e.g. IDE subprocess tool).
+                    # Close the browser and fall through to the polling path.
+                    logger.debug(f"{db_name}: stdin at EOF — switching to polling")
+                    _use_polling = True
+            finally:
+                await browser.close()
 
-    # ── Interactive TTY: open headed browser ────────────────────────────────
-    from playwright.async_api import async_playwright
-
-    search_path = _SEARCH_PATHS.get(db_name, "/")
-    base = proxy_url.rstrip("/") if proxy_url else _DIRECT_BASES.get(db_name, "")
-    start_url = f"{base}{search_path}"
-
+    # ── Polling path: instruct user, wait for session file ───────────────────
     print(
         f"\n{'='*60}\n"
-        f"  Auth required: {db_name}\n"
-        f"  Opening: {start_url}\n"
-        f"  1. Log in (SSO + Duo MFA if prompted)\n"
-        f"  2. Navigate to the search/advanced-search page\n"
-        f"  3. Press Enter here once you are on the search page\n"
-        f"{'='*60}"
+        f"  {db_name}: SSO authentication required.\n"
+        f"\n"
+        f"  In your terminal, run:\n"
+        f"    python scripts/save_browser_session.py\n"
+        f"  Select '{db_name}', complete SSO + Duo MFA,\n"
+        f"  then press Enter in that window.\n"
+        f"\n"
+        f"  The pipeline will resume automatically once\n"
+        f"  the session file is saved.\n"
+        f"{'='*60}",
+        flush=True,
     )
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        try:
-            context = await browser.new_context(user_agent=_USER_AGENT)
-            page = await context.new_page()
-            await page.goto(start_url, timeout=60_000)
-            input("  [Press Enter once you are on the search page] ")
-            await _save_session(context, db_name)
-            logger.info(f"{db_name}: fresh session saved via prompted login")
-        finally:
-            await browser.close()
+    _POLL_SEC = 5
+    _TIMEOUT_SEC = 600  # 10 minutes
+    for _ in range(_TIMEOUT_SEC // _POLL_SEC):
+        await asyncio.sleep(_POLL_SEC)
+        if session_file.exists():
+            age = _time.time() - session_file.stat().st_mtime
+            if age < 300:
+                logger.info(
+                    f"{db_name}: session file detected " f"({age:.0f}s old) — resuming"
+                )
+                return
+    raise RuntimeError(
+        f"{db_name}: timed out after "
+        f"{_TIMEOUT_SEC // 60} min waiting for session file"
+    )
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
