@@ -626,7 +626,33 @@ async def _scrape_wos(
         await page.wait_for_load_state("networkidle", timeout=30000)
         await asyncio.sleep(3)
 
-        records = await _extract_wos_results(page, max_results)
+        # Paginate through results pages until max_results reached or no Next button
+        while len(records) < max_results:
+            page_records = await _extract_wos_results(page, max_results - len(records))
+            records.extend(page_records)
+
+            if len(records) >= max_results or not page_records:
+                break
+
+            next_btn = None
+            for btn_sel in (
+                "button.mat-paginator-navigation-next",
+                'button[aria-label="Next page"]',
+                'button[aria-label="Go to next page"]',
+                ".pagination-next button",
+                'button:has-text("Next")',
+            ):
+                btn = await page.query_selector(btn_sel)
+                if btn and not await btn.get_attribute("disabled"):
+                    next_btn = btn
+                    break
+
+            if not next_btn:
+                break
+
+            await next_btn.click()
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await asyncio.sleep(3)
 
     except Exception as exc:
         logger.error(f"WoS scraping error: {exc}")
@@ -794,45 +820,74 @@ async def _scrape_scopus(
         await page.wait_for_load_state("networkidle", timeout=30000)
         await asyncio.sleep(3)
 
-        result_items = await page.query_selector_all(
-            'article[data-testid="result-item"], .searchArea .resultRow, '
-            'li[data-testid="result-item"]'
-        )
+        # Paginate through results pages until max_results reached or no Next button
+        while len(records) < max_results:
+            result_items = await page.query_selector_all(
+                'article[data-testid="result-item"], .searchArea .resultRow, '
+                'li[data-testid="result-item"]'
+            )
 
-        for item in result_items[:max_results]:
-            try:
-                title_el = await item.query_selector("h3 a, .documentTitle a")
-                title = (await title_el.inner_text()).strip() if title_el else ""
-                if not title:
+            for item in result_items:
+                if len(records) >= max_results:
+                    break
+                try:
+                    title_el = await item.query_selector("h3 a, .documentTitle a")
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+
+                    authors_el = await item.query_selector(".authorNames, .authors")
+                    authors_text = (await authors_el.inner_text()) if authors_el else ""
+                    authors = [a.strip() for a in authors_text.split(",") if a.strip()]
+
+                    year_text = ""
+                    for year_sel in (".year", "span[data-testid='year']"):
+                        el = await item.query_selector(year_sel)
+                        if el:
+                            year_text = await el.inner_text()
+                            break
+                    year = _extract_year(year_text)
+
+                    venue_el = await item.query_selector(
+                        ".sourceTitle, .publicationName"
+                    )
+                    venue = (await venue_el.inner_text()).strip() if venue_el else None
+
+                    records.append(
+                        PaperRecord(
+                            title=title,
+                            authors=authors,
+                            year=year,
+                            venue=venue,
+                            source_database="Scopus",
+                            retrieved_at=datetime.datetime.utcnow().isoformat(),
+                        )
+                    )
+                except Exception:
                     continue
 
-                authors_el = await item.query_selector(".authorNames, .authors")
-                authors_text = (await authors_el.inner_text()) if authors_el else ""
-                authors = [a.strip() for a in authors_text.split(",") if a.strip()]
+            if len(records) >= max_results or not result_items:
+                break
 
-                year_text = ""
-                for year_sel in (".year", "span[data-testid='year']"):
-                    el = await item.query_selector(year_sel)
-                    if el:
-                        year_text = await el.inner_text()
-                        break
-                year = _extract_year(year_text)
+            next_btn = None
+            for btn_sel in (
+                'button[data-testid="next-page-button"]',
+                'button[aria-label="Next"]',
+                'button[aria-label="Next page"]',
+                ".pagination-btn-next",
+                'button:has-text("Next")',
+            ):
+                btn = await page.query_selector(btn_sel)
+                if btn and not await btn.get_attribute("disabled"):
+                    next_btn = btn
+                    break
 
-                venue_el = await item.query_selector(".sourceTitle, .publicationName")
-                venue = (await venue_el.inner_text()).strip() if venue_el else None
+            if not next_btn:
+                break
 
-                records.append(
-                    PaperRecord(
-                        title=title,
-                        authors=authors,
-                        year=year,
-                        venue=venue,
-                        source_database="Scopus",
-                        retrieved_at=datetime.datetime.utcnow().isoformat(),
-                    )
-                )
-            except Exception:
-                continue
+            await next_btn.click()
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await asyncio.sleep(3)
 
     except Exception as exc:
         logger.error(f"Scopus scraping error: {exc}")
@@ -852,66 +907,82 @@ async def _scrape_ieee(
 
     records: list[PaperRecord] = []
     max_results = db_config.max_results_per_query
-    search_url = (
-        f"{search_base.rstrip('/')}/search/searchresult.jsp"
-        f"?queryText={quote_plus(query)}"
-    )
+    # IEEE supports up to 100 results per page via URL parameter
+    PAGE_SIZE = 100
+    page_num = 1
 
-    try:
-        await page.goto(search_url, timeout=30000)
-        await page.wait_for_load_state("networkidle", timeout=20000)
-        await asyncio.sleep(3)
-
-        result_items = await page.query_selector_all(
-            ".List-results-items, .result-item"
+    while len(records) < max_results:
+        search_url = (
+            f"{search_base.rstrip('/')}/search/searchresult.jsp"
+            f"?queryText={quote_plus(query)}"
+            f"&newsearch=true&rowsPerPage={PAGE_SIZE}&pageNumber={page_num}"
         )
-        for item in result_items[:max_results]:
-            try:
-                title_el = await item.query_selector("h2 a, .result-item-title a")
-                title = (await title_el.inner_text()).strip() if title_el else ""
-                if not title:
+        try:
+            await page.goto(search_url, timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await asyncio.sleep(3)
+
+            result_items = await page.query_selector_all(
+                ".List-results-items, .result-item"
+            )
+            if not result_items:
+                break
+
+            for item in result_items:
+                if len(records) >= max_results:
+                    break
+                try:
+                    title_el = await item.query_selector("h2 a, .result-item-title a")
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+
+                    authors_el = await item.query_selector(".authors-info, .author")
+                    authors_text = (await authors_el.inner_text()) if authors_el else ""
+                    authors = [
+                        a.strip() for a in re.split(r"[;,]", authors_text) if a.strip()
+                    ]
+
+                    year_text = ""
+                    year_el = await item.query_selector(
+                        ".publisher-info-container, .article-footer-pub"
+                    )
+                    if year_el:
+                        year_text = await year_el.inner_text()
+                    year = _extract_year(year_text)
+
+                    venue_el = await item.query_selector(".publication-title")
+                    venue = (await venue_el.inner_text()).strip() if venue_el else None
+
+                    doi_el = await item.query_selector('a[href*="doi"]')
+                    doi = None
+                    if doi_el:
+                        href = await doi_el.get_attribute("href") or ""
+                        m = re.search(r"10\.\d{4,}/\S+", href)
+                        doi = m.group(0) if m else None
+
+                    records.append(
+                        PaperRecord(
+                            title=title,
+                            authors=authors,
+                            year=year,
+                            venue=venue,
+                            doi=doi,
+                            source_database="IEEE Xplore",
+                            retrieved_at=datetime.datetime.utcnow().isoformat(),
+                        )
+                    )
+                except Exception:
                     continue
 
-                authors_el = await item.query_selector(".authors-info, .author")
-                authors_text = (await authors_el.inner_text()) if authors_el else ""
-                authors = [
-                    a.strip() for a in re.split(r"[;,]", authors_text) if a.strip()
-                ]
+            # Fewer items than PAGE_SIZE means this was the last page
+            if len(result_items) < PAGE_SIZE:
+                break
+            page_num += 1
 
-                year_text = ""
-                year_el = await item.query_selector(
-                    ".publisher-info-container, .article-footer-pub"
-                )
-                if year_el:
-                    year_text = await year_el.inner_text()
-                year = _extract_year(year_text)
-
-                venue_el = await item.query_selector(".publication-title")
-                venue = (await venue_el.inner_text()).strip() if venue_el else None
-
-                doi_el = await item.query_selector('a[href*="doi"]')
-                doi = None
-                if doi_el:
-                    href = await doi_el.get_attribute("href") or ""
-                    m = re.search(r"10\.\d{4,}/\S+", href)
-                    doi = m.group(0) if m else None
-
-                records.append(
-                    PaperRecord(
-                        title=title,
-                        authors=authors,
-                        year=year,
-                        venue=venue,
-                        doi=doi,
-                        source_database="IEEE Xplore",
-                        retrieved_at=datetime.datetime.utcnow().isoformat(),
-                    )
-                )
-            except Exception:
-                continue
-
-    except Exception as exc:
-        logger.error(f"IEEE Xplore scraping error: {exc}")
+        except Exception as exc:
+            logger.error(f"IEEE Xplore scraping error (page {page_num}): {exc}")
+            break
 
     return records
 
@@ -953,50 +1024,79 @@ async def _scrape_acm(
         await page.wait_for_load_state("networkidle", timeout=30000)
         await asyncio.sleep(3)
 
-        result_items = await page.query_selector_all("li.search__item")
-        for item in result_items[:max_results]:
-            try:
-                title_el = await item.query_selector("h5.issue-item__title a")
-                title = (await title_el.inner_text()).strip() if title_el else ""
-                if not title:
+        # Paginate through results pages until max_results reached or no Next button
+        while len(records) < max_results:
+            result_items = await page.query_selector_all("li.search__item")
+
+            for item in result_items:
+                if len(records) >= max_results:
+                    break
+                try:
+                    title_el = await item.query_selector("h5.issue-item__title a")
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+
+                    authors_els = await item.query_selector_all(".hlFld-ContribAuthor")
+                    authors = [
+                        (await el.inner_text()).strip()
+                        for el in authors_els
+                        if (await el.inner_text()).strip()
+                    ]
+
+                    year_text = ""
+                    date_el = await item.query_selector(
+                        ".bookPubDate, .issue-item__detail"
+                    )
+                    if date_el:
+                        year_text = await date_el.inner_text()
+                    year = _extract_year(year_text)
+
+                    venue_el = await item.query_selector(".issue-item__detail em")
+                    venue = (await venue_el.inner_text()).strip() if venue_el else None
+
+                    doi_el = await item.query_selector('a[href*="/doi/"]')
+                    doi = None
+                    if doi_el:
+                        href = await doi_el.get_attribute("href") or ""
+                        m = re.search(r"10\.\d{4,}/\S+", href)
+                        doi = m.group(0) if m else None
+
+                    records.append(
+                        PaperRecord(
+                            title=title,
+                            authors=authors,
+                            year=year,
+                            venue=str(venue) if venue else None,
+                            doi=doi,
+                            source_database="ACM Digital Library",
+                            retrieved_at=datetime.datetime.utcnow().isoformat(),
+                        )
+                    )
+                except Exception:
                     continue
 
-                authors_els = await item.query_selector_all(".hlFld-ContribAuthor")
-                authors = [
-                    (await el.inner_text()).strip()
-                    for el in authors_els
-                    if (await el.inner_text()).strip()
-                ]
+            if len(records) >= max_results or not result_items:
+                break
 
-                year_text = ""
-                date_el = await item.query_selector(".bookPubDate, .issue-item__detail")
-                if date_el:
-                    year_text = await date_el.inner_text()
-                year = _extract_year(year_text)
+            next_btn = None
+            for btn_sel in (
+                ".pagination__btn--next",
+                'a[aria-label="Next page"]',
+                'button[aria-label="Next page"]',
+                ".pagination-next a",
+            ):
+                btn = await page.query_selector(btn_sel)
+                if btn and not await btn.get_attribute("aria-disabled"):
+                    next_btn = btn
+                    break
 
-                venue_el = await item.query_selector(".issue-item__detail em")
-                venue = (await venue_el.inner_text()).strip() if venue_el else None
+            if not next_btn:
+                break
 
-                doi_el = await item.query_selector('a[href*="/doi/"]')
-                doi = None
-                if doi_el:
-                    href = await doi_el.get_attribute("href") or ""
-                    m = re.search(r"10\.\d{4,}/\S+", href)
-                    doi = m.group(0) if m else None
-
-                records.append(
-                    PaperRecord(
-                        title=title,
-                        authors=authors,
-                        year=year,
-                        venue=str(venue) if venue else None,
-                        doi=doi,
-                        source_database="ACM Digital Library",
-                        retrieved_at=datetime.datetime.utcnow().isoformat(),
-                    )
-                )
-            except Exception:
-                continue
+            await next_btn.click()
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await asyncio.sleep(3)
 
     except Exception as exc:
         logger.error(f"ACM DL scraping error: {exc}")
