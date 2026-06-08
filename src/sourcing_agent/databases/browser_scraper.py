@@ -451,15 +451,54 @@ async def _save_session(context: Any, db_name: str) -> None:
 
 
 async def prompt_and_save_session(db_name: str, proxy_url: str) -> None:
-    """Open a headed browser for db_name, wait for the user to log in, save session.
+    """Ensure a fresh browser session for db_name before querying.
 
-    Called by the pipeline before every paywalled database query (fresh auth
-    is always required — sessions are never reused across runs).  Also called
-    mid-run if auth expiry is detected during scraping.
+    TTY mode (interactive terminal): opens a headed Chromium window, waits
+    for the user to complete SSO + Duo MFA, then saves the session.
 
-    The user completes SSO + Duo MFA in the headed window, navigates to the
-    search page, then presses Enter here to persist the session.
+    Non-TTY mode (IDE/subprocess): prints instructions asking the user to
+    run ``scripts/save_browser_session.py`` in their own terminal, then
+    polls for the session file every 5 seconds and resumes automatically
+    once a fresh session (< 5 min old) is detected.  Times out after 10 min.
     """
+    import sys as _sys
+    import time as _time
+
+    if not _sys.stdin.isatty():
+        # ── Non-interactive: instruct + poll ────────────────────────────────
+        session_file = _session_path(db_name)
+        print(
+            f"\n{'='*60}\n"
+            f"  {db_name}: SSO authentication required.\n"
+            f"\n"
+            f"  In your terminal, run:\n"
+            f"    python scripts/save_browser_session.py\n"
+            f"  Select '{db_name}', complete SSO + Duo MFA,\n"
+            f"  then press Enter in that window.\n"
+            f"\n"
+            f"  The pipeline will resume automatically once\n"
+            f"  the session file is saved.\n"
+            f"{'='*60}",
+            flush=True,
+        )
+        _POLL_SEC = 5
+        _TIMEOUT_SEC = 600  # 10 minutes
+        for _ in range(_TIMEOUT_SEC // _POLL_SEC):
+            await asyncio.sleep(_POLL_SEC)
+            if session_file.exists():
+                age = _time.time() - session_file.stat().st_mtime
+                if age < 300:
+                    logger.info(
+                        f"{db_name}: session file detected "
+                        f"({age:.0f}s old) — resuming"
+                    )
+                    return
+        raise RuntimeError(
+            f"{db_name}: timed out after "
+            f"{_TIMEOUT_SEC // 60} min waiting for session file"
+        )
+
+    # ── Interactive TTY: open headed browser ────────────────────────────────
     from playwright.async_api import async_playwright
 
     search_path = _SEARCH_PATHS.get(db_name, "/")
