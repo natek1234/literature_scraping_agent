@@ -506,7 +506,7 @@ async def prompt_and_save_session(db_name: str, proxy_url: str) -> None:
             finally:
                 await browser.close()
 
-    # ── Polling path: instruct user, wait for session file ───────────────────
+    # ── Polling path: instruct user, wait indefinitely for session file ─────────
     print(
         f"\n{'='*60}\n"
         f"  {db_name}: SSO authentication required.\n"
@@ -522,20 +522,25 @@ async def prompt_and_save_session(db_name: str, proxy_url: str) -> None:
         flush=True,
     )
     _POLL_SEC = 5
-    _TIMEOUT_SEC = 600  # 10 minutes
-    for _ in range(_TIMEOUT_SEC // _POLL_SEC):
+    _REMINDER_SEC = 120  # re-print instructions every 2 minutes
+    elapsed = 0
+    while True:
         await asyncio.sleep(_POLL_SEC)
+        elapsed += _POLL_SEC
         if session_file.exists():
             age = _time.time() - session_file.stat().st_mtime
             if age < 300:
                 logger.info(
-                    f"{db_name}: session file detected " f"({age:.0f}s old) — resuming"
+                    f"{db_name}: session file detected ({age:.0f}s old) — resuming"
                 )
                 return
-    raise RuntimeError(
-        f"{db_name}: timed out after "
-        f"{_TIMEOUT_SEC // 60} min waiting for session file"
-    )
+        if elapsed % _REMINDER_SEC == 0:
+            print(
+                f"  [{db_name}] Still waiting for session file "
+                f"({elapsed // 60} min elapsed) — "
+                f"run: python scripts/save_browser_session.py",
+                flush=True,
+            )
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
